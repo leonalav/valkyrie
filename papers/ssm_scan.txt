@@ -1,0 +1,674 @@
+Below I’ll strip it down to brass tacks and wrap it back up in a neat, telling narrative: what the S5 parallel scan is, why it exists, how it’s formulated, how it’s implemented, its complexity and trade-offs, and all the little practical gotchas the paper documents. I’ll quote the paper’s appendices and main text where each load-bearing fact comes from so you can follow the source. No fluff — poetic but technical.
+
+What the parallel scan in S5 is (short)
+
+S5 uses a parallel scan (all-prefix-sum) to compute the linear recurrence of a diagonalized state-space model:
+
+𝑥
+𝑘
+=
+𝐴
+𝑥
+𝑘
+−
+1
++
+𝐵
+𝑢
+𝑘
+x
+k
+	​
+
+=Ax
+k−1
+	​
+
++Bu
+k
+	​
+
+
+after diagonalizing the continuous dynamics 
+𝐴
+=
+𝑉
+Λ
+𝑉
+−
+1
+A=VΛV
+−1
+ and working in the eigenbasis. The scan computes all prefix results in parallel via an associative binary operator, giving the whole sequence 
+𝑥
+1
+:
+𝐿
+x
+1:L
+	​
+
+ with logarithmic parallel depth (in sequence length) and linear total work. 
+
+s5
+
+ 
+
+s5
+
+Why S5 uses a parallel scan (motivation)
+
+Efficiency for diagonal dynamics. For a diagonal 
+𝐴
+A the scan reduces the expensive matrix–matrix work of general parallelization to elementwise (per state) operations. With 
+𝑃
+P latent dims and sequence length 
+𝐿
+L, the total work is 
+𝑂
+(
+𝑃
+𝐿
+)
+O(PL) and (with enough processors) parallel time 
+𝑂
+(
+log
+⁡
+𝐿
+⋅
+𝑃
+)
+O(logL⋅P) or more precisely 
+𝑂
+(
+𝑃
+log
+⁡
+𝐿
+)
+O(PlogL) if one counts per-element costs — the paper emphasises the scan becomes practical only after diagonalization. 
+
+s5
+
+Time-domain recurrence (not FFT). S4 used convolution + FFT for offline parallelism. S5 replaces that with a purely recurrent, time-domain parallel scan — which also lets S5 handle time-varying SSMs and irregular sampling easily (you can change the discrete step ∆ per step). 
+
+s5
+
+(Direct citation: Section 2.2 and 3.3 describe exactly this tradeoff.)
+
+The math: how the scan is set up (exactly)
+
+Diagonalize continuous dynamics: 
+𝐴
+=
+𝑉
+Λ
+𝑉
+−
+1
+A=VΛV
+−1
+. Work with
+
+𝑥
+~
+=
+𝑉
+−
+1
+𝑥
+x
+~
+=V
+−1
+x, 
+𝐵
+~
+=
+𝑉
+−
+1
+𝐵
+B
+~
+=V
+−1
+B, 
+𝐶
+~
+=
+𝐶
+𝑉
+C
+~
+=CV. Discretize (ZOH) to get 
+Λ
+ˉ
+Λ
+ˉ
+, 
+𝐵
+ˉ
+B
+ˉ
+. 
+
+s5
+
+Construct per-time elements for scan. For each time 
+𝑘
+k define the element
+
+𝑐
+𝑘
+=
+(
+𝑐
+𝑘
+,
+𝑎
+,
+𝑐
+𝑘
+,
+𝑏
+)
+:
+=
+(
+𝐴
+,
+  
+𝐵
+𝑢
+𝑘
+)
+c
+k
+	​
+
+=(c
+k,a
+	​
+
+,c
+k,b
+	​
+
+):=(A,Bu
+k
+	​
+
+)
+
+(in the diagonalized / discretized domain these are vectors per state). 
+
+s5
+
+Binary associative operator 
+∙
+∙ used by the scan:
+
+𝑞
+𝑖
+∙
+𝑞
+𝑗
+:
+=
+(
+𝑞
+𝑗
+,
+𝑎
+ 
+𝑞
+𝑖
+,
+𝑎
+  
+,
+  
+𝑞
+𝑗
+,
+𝑎
+⊗
+𝑞
+𝑖
+,
+𝑏
++
+𝑞
+𝑗
+,
+𝑏
+)
+q
+i
+	​
+
+∙q
+j
+	​
+
+:=(q
+j,a
+	​
+
+q
+i,a
+	​
+
+,q
+j,a
+	​
+
+⊗q
+i,b
+	​
+
++q
+j,b
+	​
+
+)
+
+where 
+⋅
+⋅ is matrix multiplication, 
+⊗
+⊗ matrix-vector multiply, and + is vector add. The scan over 
+[
+𝑐
+1
+,
+…
+,
+𝑐
+𝐿
+]
+[c
+1
+	​
+
+,…,c
+L
+	​
+
+] with this operator returns prefix pairs whose second component is the desired 
+𝑥
+𝑘
+x
+k
+	​
+
+. The paper proves associativity. 
+
+s5
+
+Intuition / 4-step worked example. For 
+𝐿
+=
+4
+L=4 the paper shows step-by-step how adjacent reductions let you compute in two parallel layers instead of four sequential ones. This is the classic parallel prefix algorithm illustrated concretely in Appendix H. 
+
+s5
+
+Implementation (what the paper ships and why)
+
+The authors include a minimal JAX implementation (Appendix A). Key practical points:
+
+They use jax.lax.associative_scan (JAX’s parallel scan primitive) to run the binary operator over the sequence. The code sets parallel_scan = jax.lax.associative_scan. 
+
+s5
+
+discretize(Lambda, B_tilde, Delta) computes 
+Λ
+ˉ
+=
+exp
+⁡
+(
+Λ
+Δ
+)
+Λ
+ˉ
+=exp(ΛΔ) and 
+𝐵
+ˉ
+=
+(
+Λ
+−
+1
+(
+Λ
+ˉ
+−
+𝐼
+)
+)
+𝐵
+~
+B
+ˉ
+=(Λ
+−1
+(
+Λ
+ˉ
+−I))
+B
+~
+ (ZOH discretization expressed elementwise). 
+
+s5
+
+binary_operator in the code implements: return A_j * A_i, A_j * Bu_i + Bu_j (elementwise multiplication across diagonalized state dims). That matches the math: composition of A blocks and accumulation of transformed Bu terms. 
+
+s5
+
+The scheme computes Bu_elements = jax.vmap(lambda u: B_bar @ u)(input_sequence) and then does the associative scan to yield states xs. Finally outputs ys = C_tilde @ xs + D * u then applies nonlinear activation (e.g., GELU) to get layer outputs. 
+
+s5
+
+So if you want to implement S5: diagonalize 
+𝐴
+A → compute discretized 
+Λ
+ˉ
+,
+𝐵
+ˉ
+Λ
+ˉ
+,
+B
+ˉ
+ → compute per-step Bu → associative_scan with the operator → map back with 
+𝐶
+~
+C
+~
+. The paper’s code is intentionally compact and directly maps math → code. 
+
+s5
+
+Complexity and resource profile (exact statements)
+
+Total work (offline, parallel): computing the recurrence with a diagonal 
+𝐴
+A costs 
+𝑂
+(
+𝑃
+𝐿
+)
+O(PL) operations and 
+𝑂
+(
+𝑃
+𝐿
+)
+O(PL) memory (work-efficient scan). The matrix-vector products to form Bu and Cx add 
+𝑂
+(
+𝑃
+𝐻
+𝐿
+)
+O(PHL) operations overall. When 
+𝑃
+=
+𝑂
+(
+𝐻
+)
+P=O(H), S5’s total asymptotic cost and memory are the same order as S4’s efficient FFT-based convolution (the paper proves Proposition 1).
+
+Parallel time (with many processors): the scan reduces sequential depth to 
+𝑂
+(
+log
+⁡
+𝐿
+)
+O(logL) (with per-state cost factors), so the parallel time is 
+𝑂
+(
+𝑃
+log
+⁡
+𝐿
+)
+O(PlogL) if you count per-state work, or more compactly 
+𝑂
+(
+log
+⁡
+𝑃
++
+log
+⁡
+𝐿
+)
+O(logP+logL) in their ideal processor accounting when enough processors are available. The paper references Blelloch (1990) for the parallel prefix complexity details.
+
+Online per-step cost (recurrent mode): S5 uses 
+𝑂
+(
+𝑃
+𝐻
++
+𝑃
+)
+O(PH+P) operations per step (diagonal multiply + Bu and Cx multiplications). With 
+𝑃
+=
+𝑂
+(
+𝐻
+)
+P=O(H) this matches S4’s per-step complexity of 
+𝑂
+(
+𝐻
+2
+)
+O(H
+2
+) (S4’s DPLR and mixing). 
+
+s5
+
+Practical speedups: their empirical JAX benchmarks show S5 can be faster than S4/S4D for long sequences (Table 4): e.g., on Path-X (length 16,384) S5 shows multi-fold speedups (their best S5 variant was ~4× faster in train step speed relative to S4D baseline in their setup). See Appendix C.2.
+
+Numerical / parameterization details that affect the scan
+
+Diagonalization requirement. Efficient scans require 
+𝐴
+A diagonal (or block-diagonal with small blocks). S5 parameterizes the model by diagonalizing a chosen initial 
+𝐴
+A and learns in that basis; discretization uses per-state timescales ∆. 
+
+s5
+
+HiPPO / initialization. The HiPPO-LegS matrix (used in S4) is not stably diagonalizable — so S5 uses the diagonalization of the HiPPO-N (normal) component as a practical initialization (and can also use block-diagonal HiPPO-N). That preserves the useful long-range dynamics while allowing diagonalization for scanning. This choice is empirically important.
+
+Conjugate symmetry (complex eigenpairs): real matrices have complex conjugate eigenpairs. S5 enforces conjugate symmetry and only stores half the eigenvalues / states to guarantee real outputs and reduce runtime/memory by ≈2×. This affects how the scan is run (work on complex pairs but store fewer). 
+
+s5
+
+Block-diagonal initialization option: the authors found initializing 
+𝐴
+A as block-diagonal (several HiPPO-N blocks) sometimes helps and still allows efficient scanning if blocks are small — a middle ground between full dense and fully diagonal. 
+
+s5
+
+Proofs, associativity, and correctness (details)
+
+The paper defines the operator and then proves it is associative (Appendix H). Associativity is necessary so associative_scan or any parallel prefix algorithm is correct. The appendices also include the L=4 worked example showing how parallel composition yields prefix states in 
+𝑂
+(
+log
+⁡
+𝐿
+)
+O(logL) rounds instead of 
+𝑂
+(
+𝐿
+)
+O(L) rounds.
+
+Practical advantages / special capabilities because of the scan
+
+Time-varying SSMs & irregular samples. Because S5 does time-domain recurrence, you can pass a different discrete step ∆ (or even different 
+𝐴
+𝑘
+A
+k
+	​
+
+) at each time step efficiently — something the frequency-domain convolution in S4 cannot do without re-computing kernels. S5 uses the same scan machinery but with per-step discretized matrices. This is key for irregularly sampled time series (pendulum experiment in paper).
+
+Simplicity of implementation. the JAX code is compact (Appendix A) and directly uses associative_scan. That lowers engineering friction. 
+
+s5
+
+Limitations, caveats, and gotchas (what the paper warns about)
+
+Diagonalization numerics: you cannot literally use HiPPO-LegS’s full matrix because it’s not stably diagonalizable — you must use a normal approximation (HiPPO-N) or a DPLR/block diagonal approximation to be numerically stable. Using the wrong diagonalization will break performance or numeric stability. 
+
+s5
+
+Processor model vs real hardware. The theoretical parallel time assumes many processors (one per stream element). On real GPUs/TPUs there are scheduling and memory tradeoffs; their empirical benchmarks are on JAX with V100 GPUs and show real wins for long sequences, but results depend on hardware, batching, and implementation details. See Appendix C.2 for empirical evidence. 
+
+s5
+
+Complex types & memory layout. Working in the eigenbasis introduces complex values — implementation must handle complex dtypes or the conjugate-symmetry trick carefully. 
+
+s5
+
+Everything actionable (if you’re going to implement / experiment)
+
+Diagonalize a stable, normal initialization (HiPPO-N) to get 
+Λ
+,
+𝑉
+Λ,V. Initialize 
+𝐵
+~
+=
+𝑉
+−
+1
+𝐵
+B
+~
+=V
+−1
+B, 
+𝐶
+~
+=
+𝐶
+𝑉
+C
+~
+=CV.
+
+Use ZOH discretization per state: 
+Λ
+ˉ
+=
+exp
+⁡
+(
+Λ
+Δ
+)
+Λ
+ˉ
+=exp(ΛΔ), 
+𝐵
+ˉ
+=
+Λ
+−
+1
+(
+Λ
+ˉ
+−
+𝐼
+)
+𝐵
+~
+B
+ˉ
+=Λ
+−1
+(
+Λ
+ˉ
+−I)
+B
+~
+. (See discretize() in Appendix A.) 
+
+s5
+
+Compute per-step Bu_k = B_bar @ u_k for all k (batched vmap), then do associative_scan with binary_operator returning (A_j * A_i, A_j * Bu_i + Bu_j); the second field of scan outputs gives you states x_k. 
+
+s5
+
+Convert back to outputs with 
+𝐶
+~
+𝑥
+𝑘
++
+𝐷
+𝑢
+𝑘
+C
+~
+x
+k
+	​
+
++Du
+k
+	​
+
+, then nonlinearity. 
+
+s5
+
+Enforce conjugate symmetry to halve runtime/memory: parameterize only half the eigenpairs and reflect them. 
+
+s5
+
+Short reading map to the paper (where to look for each major point)
+
+Core idea + diagonalization + why scans: Section 3.2–3.3. 
+
+s5
+
+Complexity proof and proposition: Appendix C (C.1 + C.2).
+
+The parallel-scan operator, associativity proof, L=4 example: Appendix H (Background on parallel scans).
+
+JAX code and minimal implementation: Appendix A. 
+
+s5
+
+Initialization (HiPPO-N, conjugate symmetry, timescale sampling): Appendix B (B.1.*).
+
+Final blunt take (no sugar)
+
+The S5 parallel scan is the clean, practical trick that turns an SSM into a time-domain algorithm that is both implementable (short code) and competitive with S4’s FFT approach. It hinges on diagonalizing dynamics (or small blocks) and exploiting an associative operator so prefix sums = states. If you diagonalize poorly you’ll wreck stability; if you diagonalize well (HiPPO-N or block HiPPO-N) you get the long-range inductive biases and a fast, flexible runtime that handles variable timesteps. The paper proves the operator, gives worked examples, ships JAX code, and shows empirical speed/accuracy benefits. Read Appendix H + Appendix A + Appendix C in that order if you want to go from concept → code → benchmarks.

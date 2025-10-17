@@ -1,0 +1,46 @@
+BigBird Attention Performance Benchmark Report
+==================================================
+
+Summary Statistics:
+Total configurations tested: 36
+Average throughput: 12369.49 tokens/sec
+Best throughput: 64373.12 tokens/sec
+Average memory usage: 83.73 MB
+
+Performance by Configuration:
+  Small:
+    Average throughput: 29383.07 tokens/sec
+    Average memory: 25.38 MB
+
+  Medium:
+    Average throughput: 9277.18 tokens/sec
+    Average memory: 78.88 MB
+
+  Large:
+    Average throughput: 6181.93 tokens/sec
+    Average memory: 116.53 MB
+
+Scaling Analysis:
+  Throughput by batch size:
+    Batch 1: 8641.23 tokens/sec
+    Batch 2: 12788.28 tokens/sec
+    Batch 4: 13546.53 tokens/sec
+    Batch 8: 14501.91 tokens/sec
+
+  Throughput by sequence length:
+    Length 256: 24895.19 tokens/sec
+    Length 512: 7559.60 tokens/sec
+    Length 1024: 4733.73 tokens/sec
+    Length 2048: 4493.57 tokens/sec
+
+  Memory usage by sequence length:
+    Length 256: 27.42 MB
+    Length 512: 54.61 MB
+    Length 1024: 129.70 MB
+    Length 2048: 248.03 MB
+
+Optimization Insights:
+- Vectorized random plan generation eliminates Python loops
+- LRU cache reduces recomputation for repeated sequence lengths
+- Shape validation prevents runtime errors and improves reliability
+- RoPE padding fixes ensure correct multi-length batch handling

@@ -1,0 +1,659 @@
+TL;DR (first things to internalize)
+
+----------------------------------------------------------------------------
+WARNING: WE ARE USING TPUs FOR TRAINING. IGNORE ANYTHING THAT MENTIONS GPUs.
+----------------------------------------------------------------------------
+Longformer uses sliding window local attention + a small set of global tokens; implementations come in three flavours (loop, chunked, CUDA/TVM kernel). For training/finetuning, the chunked vectorized implementation is the practical choice; for huge sequences / dilation you need the CUDA kernel. 
+
+longformer
+
+ 
+
+longformer
+
+S5 expects a diagonalized continuous-time SSM, discretized (ZOH) and applied via a correct parallel scan or recurrent loop. The JAX appendix shows the canonical discretize / binary operator / apply_ssm pattern — match that exactly. 
+
+s5
+
+ 
+
+s5
+
+Attention in fp16 is dangerous. Longformer authors kept attention computation in fp32 to avoid NaNs/overflows. Use mixed precision carefully: keep attention matmuls in fp32. 
+
+longformer
+
+Your 1_jax.py already implements many pieces. There are shape, dtype, broadcasting, and tiny syntax bugs and subtle semantic pitfalls I list below with exact pointers and fixes. 
+
+1_jax
+
+Part A — Architecture & training-level checklist (what to implement once, and how to stage training)
+
+Follow the staged training schedule from the Longformer paper when scaling sequence length.
+
+Use phases where you double the sequence length and window size, and halve learning rate each phase; 5 phases is typical; start at seq_len 2048 and end at 23,040 for character-LM experiments; batch sizes & steps per phase are in the paper. Don’t try to train at the final max length from scratch — it will fail to learn local patterns. 
+
+longformer
+
+Optimizer / LR / warmup / schedulers: use AdamW, gradient clipping, weight decay, and warmup (10% of phase steps or up to 10k). Longformer: LR typical range and the phase schedule in the paper. Use separate weight decay for bias/LayerNorm as usual. 
+
+longformer
+
+Mixed precision policy (AMP):
+
+Use fp16 for most model weights if you need memory, but keep attention computations in fp32 (QK matmul and softmax). Either cast Q and K to float32 before matmul or compute softmax in float32. Longformer authors observed fp16 attention leads to NaNs. 
+
+longformer
+
+S5 uses complex arithmetic internally. Keep the S5 diagonalized math in complex64 for stability and only convert final preactivations to float32. Your code already does that — good — but verify JAX gradients with complex64 (see below). 
+
+s5
+
+Checkpointing / gradient checkpointing: enable for long sequences (your config has it). But verify recomputation doesn’t re-create complex dtype mismatches (e.g., recompute path must use same dtype). 
+
+1_jax
+
+Batching & padding policy:
+
+For Longformer, if you pad to a uniform seq_len per batch, ensure global index mapping excludes padded positions. For MLM pretraining, mask selection must not select padded tokens.
+
+When using chunked attention, chunk boundaries and overlapping windows must be consistent with padding.
+
+Stage tests: at each implementation step overfit a tiny dataset (single batch, few tokens) and check loss drops to ~zero. If it doesn’t, don’t proceed — debug shapes/dtypes first.
+
+Part B — S5 (state space) — exact implementation cautions & tests
+
+You are already implementing the S5 layer in 1_jax.py. The S5 paper includes a clean JAX reference in Appendix A; your code should mirror its semantics exactly. Key pitfalls and fixes:
+
+1. Complex dtype & conjugate-symmetry
+
+What you must ensure: The S5 implementation uses conjugate pairs to keep everything real-valued at outputs. Build the complex eigenvalues Λ by concatenating (Λ_re + i Λ_im) with its conjugate counterpart (Λ_re - i Λ_im). Same for B̃ and C̃. You've done this in _get_complex_params() — good — but ensure all downstream arrays that multiply these complex arrays are complex dtype. Don’t silently mix complex64 with float32 in arithmetic; JAX will raise a ComplexWarning or coerce unexpectedly. See your _get_complex_params() and discretize() where you cast Delta to complex — that's correct. 
+
+1_jax
+
+2. Discretization broadcasting shape traps
+
+Bug to watch: (Lambda_bar - 1.0) / Lambda yields shape (P,); when you multiply by B_tilde (shape (P, H)), broadcasting must be (P,1) * (P,H). You already add [:, None] to discretization_term in discretize() — this is required. If you forget that or shape is mismatched (e.g., half vs full state), you'll get broadcast errors. 
+
+1_jax
+
+3. Delta (timescale) length matching Λ length
+
+You created log_Delta with shape self.state_dim and then Delta = exp(log_Delta). Make sure Lambda length equals Delta length. In your code you build Lambda by concatenating half→full: Lambda_re_full = concat([Lambda_re, Lambda_re]). If you accidentally keep Delta only half-length, discretization will error. Confirm shapes: Lambda.shape == Delta.shape. (Add assert.)
+
+4. jax.lax.associative_scan usage
+
+associative_scan requires a binary associative operator and the elems pytree shape must align. Your binary_operator implements (A_j * A_i, A_j * Bu_i + Bu_j) which matches the S5 pdf operator; good. However: depending on JAX version and how you call associative_scan, return semantics differ — test it: compare associative_scan output to the output of a simple Python loop recurrence for small L and check exact match (both values and dtype). The S5 paper shows the same operator; mirror their example exactly to avoid off-by-axis errors. 
+
+s5
+
+5. Parallel scan axis shape & pytree layout
+
+You create elements = (A_elements, Bu_elements) where A_elements is broadcasted to (B, L, P) and Bu_elements is (B, L, P). Ensure associative_scan is called along axis=1 if your elements have shape (B, L, P) and you want to scan across timesteps. Verify signature in your JAX version: some versions require associative_scan(fn, elems, axis=0) and will return only the reduced results. Test thoroughly. (Add unit test comparing parallel vs recurrent for B=1.) 
+
+1_jax
+
+6. Extracting real outputs & complex gradients
+
+After C_tilde @ x, you take .real.astype(jnp.float32); that’s necessary. But be careful: .real detaches the imaginary part — gradients through complex→real work in JAX if operations were complex earlier, but check you’re not inadvertently breaking gradient paths with python-level .real conversion. The S5 reference uses .real in apply_ssm as well. Run gradient checks (finite differences) on small net to ensure gradient correctness. 
+
+s5
+
+7. Numerical stability: small |Λ| or near-zero eigenvalues
+
+Your Lambda_safe = where(abs(Lambda) < 1e-8, 1e-8 + 0j, Lambda) is a good protective measure. Keep it. Also watch exp(Lambda * Δ) for overflows if real(Lambda)*Δ is large positive/negative — initialize real(Lambda) < 0 for stability (your initializer does negative real part — good). 
+
+1_jax
+
+8. Tests you must add for S5
+
+Unit test: feed a single random u sequence and compare:
+
+apply_ssm via associative_scan outputs vs step repeated recurrence outputs (elementwise) — must match to numerical tolerance.
+
+Gradients via jax.grad(loss, params) vs finite difference check.
+
+Overfit test: tiny model should reduce train loss quickly.
+
+Numeric checks: jnp.isfinite(...) assertions after heavy ops.
+
+Part C — Longformer attention implementation pitfalls (from the paper + your ValkyrieLongformerAttention)
+
+You have a chunked implementation planned in 1_jax.py. Good. The papers and snippets give these exact caveats.
+
+1. Three implementation modes (choose consciously)
+
+Loop: correct and supports dilation but too slow — use only for unit tests.
+
+Chunked (vectorized): supports non-dilated sliding windows and is used for pretraining/finetuning — practical. Your longformer_chunked: True default matches this. But chunked does not support dilation. Don’t turn on dilation unless you implement the full cuda/TVM kernel. 
+
+longformer
+
+CUDA/TVM kernel: needed when you want dilation or highest memory efficiency. Building/maintaining that is non-trivial. 
+
+longformer
+
+2. Attention dtype: keep attention matmuls in fp32
+
+If you do fp16 globally to save memory, cast Q and K to float32 for the QK^T / softmax. The paper explicitly found fp16 attention produced NaNs later. Implement with jax.experimental.enable_x64() style or manual casts around softmax if needed. 
+
+longformer
+
+3. Head / KV head mismatches
+
+You have n_kv_heads and q_per_kv = n_heads // n_kv_heads. This is correct design, but you must be absolutely consistent in reshapes:
+
+Qs shape: [B, T, n_heads, head_dim]
+
+Ks / Vs shape (after kv projection): [B, T, n_kv_heads, head_dim]
+
+For computing attention scores for each query head, either tile/repeat Ks/Vs or reshape to broadcast (repeat q_per_kv times). Implement this carefully and assert shapes at runtime. If you mismatch q_per_kv and n_heads % n_kv_heads != 0, you will get silent shape errors — but your ValkyrieConfig asserts n_heads % n_kv_heads == 0. 
+
+1_jax
+
+4. RoPE application shape & indexing
+
+apply_rope expects x shape [batch, seq_len, num_heads, head_dim] and position_ids shape [batch, seq_len]. You precompute cos_freqs and sin_freqs shape [max_seq_len, head_dim//2]. Indexing with cos_freqs[position_ids] works in JAX and yields [batch, seq_len, head_dim//2] — but ensure position_ids dtype is integer and in-range. Watch out for negative or padded positions. Your code uses expand_dims and interleaving — test this thoroughly. 
+
+1_jax
+
+5. Global attention symmetry & KV caching
+
+Global tokens must be symmetric: token i marked global must attend to all tokens and all tokens must attend to it. Implement both directions. Maintain a separate KV cache for global streams vs local streams (you do). For generation caching: ensure the incremental logic correctly appends to global caches and that RoPE positions are stable across cached steps. 
+
+1_jax
+
+6. Chunked windowing implementation pitfalls
+
+When you chunk Q/K into overlapping blocks:
+
+Overlap size must be exactly window_size//2.
+
+Masking after block matmul must remove off-window interactions.
+
+Watch reshaping permutations (C-order vs Fortran ordering) — wrong reshape axis = completely wrong attention. Add small unit test verifying that for tiny sequences your chunked output matches brute-force full sparse attention computed by masked dense computation.
+
+7. Dilation: don't enable unless you implement CUDA/TVM
+
+The chunked implementation doesn’t support dilation; the dilated sliding window needs a special banded-matrix kernel or loop approach. Longformer used dilation only on a few heads (2 heads) in higher layers and only for char-level LM experiments — probably unnecessary for many tasks. 
+
+longformer
+
+Part D — Concrete bugs / lines to fix in 1_jax.py (surgical)
+
+I inspected the snippets; here are precise, actionable things to fix or assert in your code:
+
+Fix small typos in apply_rope (seen in some truncated snippets):
+
+In one snippet I saw x_odd = x[. 1::2] and x_even = x[. ::2] — those are syntax errors (. before slice). Make sure code uses x[..., ::2] and x[..., 1::2]. Search your file for mis-typed slice syntax and fix. 
+
+1_jax
+
+Add asserts in discretize():
+
+assert Lambda.ndim == 1 and B_tilde.ndim == 2
+assert Lambda.shape[0] == B_tilde.shape[0]
+Delta = Delta.astype(jnp.complex64)
+
+
+And after building discretization_term[:, None] * B_tilde, assert resulting B_bar.shape == (P, d_model).
+
+Your code already uses [:, None] — keep it. 
+
+1_jax
+
+Confirm associative_scan return contract — change:
+
+_, xs = jax.lax.associative_scan(self.binary_operator, elements, axis=1)
+
+
+to something like:
+
+xs = jax.lax.associative_scan(self.binary_operator, elements, axis=1)
+# if elems is a pytree of (A_elements, Bu_elements), xs will match that structure
+# test and unpack appropriately
+
+
+Then test with a simple python loop to verify equal outputs. JAX versions can behave differently for return shapes. 
+
+1_jax
+
+Ensure B_bar dtype is complex64, Lambda_bar is complex64, and that Bu_elements = einsum('sd,btd->bts', B_bar, u) will produce complex results if B_bar complex. But u is float32; einsum will upcast to complex (ok) — but you must ensure later .real is used appropriately and gradients flow. Consider explicitly casting Bu_elements = jnp.einsum(...) .astype(jnp.complex64) as needed.
+
+In parallel_scan, elements must be a pytree of shape (batch, seq_len, P). You do A_elements = broadcast_to(Lambda_bar[None, None, :], (batch_size, seq_len, self.state_dim)) — that’s correct; ensure you do elements = (A_elements, Bu_elements) and then call associative_scan along axis=1. After scan, xs indexing may be (A_scan, Bu_scan) — unpack correctly. Add unit tests. 
+
+1_jax
+
+S5 final output real casting — make consistent: after C_xs = einsum('ds,bts->btd', C_tilde, xs), do:
+
+C_xs_real = jnp.real(C_xs).astype(jnp.float32)
+
+
+You already do a jnp.iscomplexobj check — keep it, but prefer jnp.real for clarity. 
+
+1_jax
+
+Add assert head_dim % 2 == 0 & assert head_dim <= 256 (you have this in ValkyrieConfig — good). 
+
+1_jax
+
+Part E — Safety nets, debugging recipes and unit tests (do these before running big jobs)
+
+Tiny overfit test: single GPU, batch_size=2, seq_len=128, run 1000 steps — loss should go to near-zero. If not: inspect shapes, gradients, parameter initialization.
+
+Parallel vs recurrent equality test (S5): for random u (L small say 8), run:
+
+Recurrent: run step sequentially accumulating x.
+
+Parallel: run your parallel_scan path.
+
+Compare arrays (use jnp.testing.assert_allclose with rtol=1e-5, atol=1e-6).
+
+Chunked attention correctness test: implement a brute-force sparse attention that uses masked full attention and verify the chunked output equals it for small sequences and a few random seeds.
+
+Grad-check: compare jax.grad(loss, params) to finite difference approximations for a few parameters.
+
+NaN/Inf Detector: after key ops run assert jnp.all(jnp.isfinite(tensor)) and optionally tensor = jnp.nan_to_num(tensor) for debugging but do not use as permanent fix.
+
+Disable JIT for debugging: jax.config.update('jax_disable_jit', True) while debugging shapes — JIT hides stack traces. Once tests pass, re-enable JIT.
+
+Mixed precision smoke test: run 100 steps with mixed precision enabled and check for NaNs in attention; if they appear, run attention in fp32 as recommended. 
+
+longformer
+
+Part F — Hyperparameters (copy from Longformer — use as baseline)
+
+Number of phases: 5; starting seq_len 2048 → end 23,040 (character-LM setup). Phase LR halved each phase (phase1 LR 2.5e-4, phase5 1.5625e-5 in char-LM). Batch sizes 32→16. Warmup 10% of phase steps. Use gradient checkpointing. See table. 
+
+longformer
+
+Attention window schedule: increase window sizes across layers; experiment suggests increasing w from bottom to top works best; dilation on 2 heads in higher layers showed mild gains (but needs CUDA). 
+
+longformer
+
+Optimization: AdamW, weight decay ~0.01, gradient clip 0.25 (paper), layernorm pre-norm. 
+
+longformer
+
+Part G — Practical engineering details & GPU / memory tips
+
+Use chunked attention for training / fine-tuning. Only reach for the TVM kernel when you need very long sequences or dilation. Implement tests comparing chunked vs full for small sequences.
+
+KV caching memory layout: keep local KV stream separate from global KV stream. When generating, only append to caches; don't recompute all K/V. Your LongformerKVCache type is a good pattern — but test cache indexing carefully.
+
+Gradient accumulation: for long sequences you may need to accumulate gradients across microbatches. Make sure your S5 parallel scan and Longformer chunked implementations are stateless with respect to accumulation.
+
+Device placement & pmap: When sharding across multiple GPUs, ensure associative_scan usage is compatible with pmap or use pjit with partitioning that keeps sequence axis local to a device if needed.
+
+Part H — Final concrete checklists you can copy/paste into code
+Pre-launch sanity checks (run these before full training)
+
+ assert head_dim % 2 == 0 and head_dim <= 256. 
+
+1_jax
+
+ After building complex Lambda, B_tilde, C_tilde assert Lambda.shape == (state_dim,) and B_tilde.shape == (state_dim, d_model). 
+
+1_jax
+
+ assert jnp.isfinite(Lambda).all() and jnp.isfinite(B_tilde).all()
+
+ Run S5 recurrent vs parallel equivalence unit test (B=1, L small). 
+
+s5
+
+ Run chunked attention vs masked full attention comparison (small sequences). 
+
+longformer
+
+ Run fp16/mixed precision check: compute one forward/backward with attention in fp32 and with attention in fp16 and confirm no NaNs. 
+
+longformer
+
+If you hit NaNs / divergence
+
+Immediately set attention matmuls to fp32 and re-run.
+
+Reduce LR by ×10.
+
+Run jax.config.update('jax_debug_nans', True) to get an early stack trace.
+
+Overfit a single batch — if loss doesn’t decrease, there’s a bug.
+
+Closing — Honest, realistic expectations
+
+You’re combining two sophisticated, numerically delicate systems: Longformer’s sparse attention (with multiple implementation strategies) and S5’s complex-valued diagonalized continuous-time SSM plus parallel scan. Each on its own demands careful testing; combined they demand exacting unit tests (parallel vs recurrent, chunked vs brute-force). The papers provide canonical hyperparameters and canonical JAX snippets (S5 Appendix) — use them as ground truth while you adapt to Flax modules. The places where most projects crash: dtype mixing in attention, wrong broadcasting / einsum axes, associative_scan misuse, and chunking index bugs — I highlighted each above with direct pointers to your code and the paper.
+
+
+I’ll be blunt: trying to naively feed 657k tokens into a normal transformer with full attention is a guaranteed death march — quadratic memory/compute explodes. You must combine sparse local attention (Longformer) + SSM memory (S5) + chunked/truncated training + heavy sharding and memory engineering. Do all of the following.
+
+1) High-level strategy (one-sentence)
+
+Break each 657k document into streamed chunks (chunks you process one-by-one) with overlapping local sliding-window attention inside each chunk, S5 state(s) carrying long-term memory between chunks, and selective global summaries / compression tokens that connect distant chunks — and train with a curriculum that increases chunk length and the number of chunks you backprop through.
+
+Support items: Longformer chunked sliding window + a heavy S5 memory that’s passed as state between chunks — this gives near-linear compute while preserving very long-range dependency capacity.
+
+Relevant engineering/algorithm sources: H100 specs & FP8 support, FlashAttention support on H100, DeepSpeed ZeRO/FSDP strategies, and recent chunk-wise/truncated methods. 
+arXiv
++4
+NVIDIA
++4
+NVIDIA Docs
++4
+
+2) Immediate architecture & training changes you must make
+
+Chunk the sequence
+
+Don’t feed 657k tokens to any layer at once. Partition into chunks C of size S. Reasonable starting settings to experiment with:
+
+S = 8k–32k tokens per chunk for training experiments.
+
+Keep an overlap O = window_size (so sliding-window attention in the chunk has correct context across chunk boundaries) or use explicit S5 state to bridge.
+
+Example: 657k / 8k ≈ ~82 chunks.
+
+Use chunk streaming: compute activations for chunk 0, update S5 state, move to chunk 1, etc.
+
+Local sparse attention inside chunks (Longformer chunked)
+
+Use chunked / vectorized sliding-window attention (not naive full attention). This is linear in N × window not N². The chunked variant is the realistic one for large-scale training. Do not use the loop implementation at scale. (Chunked implementation generally does not support dilation; if you need dilation you must use kernels.) 
+GitHub
++1
+
+Use S5 as the inter-chunk memory carrier
+
+Treat S5 as the recurrent summary: after processing chunk i, update S5 state and pass it into processing of chunk i+1. This gives you long-range ability without making attention quadratic.
+
+Two modes:
+
+TBPTT-style with S5 state: mostly detach S5 states between chunks (cheap) and occasionally do long unrolls where you keep gradients across many chunks (expensive) to train the S5 for very long-range credit assignment.
+
+Full-backprop occasionally: every K steps (K small early, larger later), backprop across many chunks to let gradients flow long-range.
+
+Hierarchical/summarization tokens
+
+In addition to S5, compress each chunk to a small set of summary/global tokens (e.g., 8–64 tokens) via a light pooling / cross-attention layer. Those tokens are allowed global attention and connect chunks more cheaply. This hybrid (local windows + S5 + small global tokens) is the practical architecture used by many long-context systems.
+
+Progressive curriculum
+
+Don’t start training on 657k sequences. Start with short chunks and short contexts:
+
+phase0: chunk size 2k, backprop 2 chunks
+
+phase1: 8k chunk, backprop 4 chunks
+
+phase2: 32k chunk, backprop 8 chunks
+
+phase3: 128k (or until memory), backprop 16+ chunks
+
+phase4: target regime approximate to 657k by increasing chunk count (not chunk size) and occasionally doing extremely long unrolls for S5 gradient flow.
+
+This is the same idea Longformer used (scale lengths gradually). 
+arXiv
++1
+
+Truncated backprop + intermittent long-backprop
+
+Use truncated BPTT across chunks to limit activation memory. E.g., accumulate gradient after N chunks, then update. Periodically perform longer backprop windows to allow the model to learn long-term dependencies.
+
+Window sizes and local/global design
+
+Local window size (Longformer): experiment with w = 2k – 8k for big chunks (smaller + many chunks also works). More heads with local sliding windows, and 1–4 global heads to handle global tokens. Global tokens must be symmetric (attend-to-all and reachable-from-all). 
+GitHub
+
+3) Memory arithmetic: know what you’re fighting (exact, step-by-step)
+
+You must budget memory for (a) model weights, (b) optimizer state, (c) gradients, (d) activations and attention buffers, (e) KV caches (for generation), and (f) extra master copies when using AMP. Here are concrete numbers for a 1.2B-parameter model.
+
+Parameters: P = 1,200,000,000 (1.2B)
+
+Float32 bytes per parameter = 4 bytes.
+P * 4 = 1,200,000,000 * 4 = 4,800,000,000 bytes = 4.8e9 bytes ≈ 4.8 GB.
+
+Float16 (FP16) bytes per parameter = 2 bytes.
+P * 2 = 1,200,000,000 * 2 = 2,400,000,000 bytes ≈ 2.4 GB.
+
+If you use mixed precision with a master FP32 copy (common):
+
+FP16 copy: 2.4 GB
+
+FP32 master: 4.8 GB
+
+total weight storage ≈ 2.4 + 4.8 = 7.2 GB.
+
+Adam-like optimizer (m and v) typically stored in FP32: that’s 2 * 4.8 = 9.6 GB.
+
+Gradients in FP32: another 4.8 GB.
+
+Total basic parameter + optimizer + gradient memory (typical AMP with master copy):
+weights (7.2) + optimizer (9.6) + grads (4.8) = 21.6 GB (approx).
+
+That’s before activations. Activations dominate when seq length is huge. Activations roughly scale with batch_size * seq_len * hidden_dim — and for 657k tokens activations are astronomical unless you stream and truncate. So you cannot hold activations for 657k at once: you need chunking + recomputation / checkpointing.
+
+What this implies:
+
+On a single H100 (80GB), the raw parameter/optimizer budget (~21.6 GB) might fit, but activations and attention buffers will not if you try to handle huge chunks or many layers without sharding. You need sharding/ZeRO/FSDP across devices. Use optimizer sharding (ZeRO/FSDP or full parameter sharding) across GPUs or TPU chips. 
+NVIDIA
++1
+
+4) H100 vs TPU v5e-8 — which to pick and how to use them
+
+Short answer: both can work; choice drives your tooling.
+
+H100 (NVIDIA Hopper) — good for PyTorch + DeepSpeed/TransformerEngine/FlashAttention pipeline. H100 supports FP8/Transformer Engine and FlashAttention-3 for super-fast attention kernels on Hopper. Use:
+
+PyTorch + DeepSpeed ZeRO (or FSDP) for optimizer sharding. ZeRO Stage 3/4 is essential to shard optimizer state & parameters across GPUs. 
+DeepSpeed
++1
+
+FlashAttention / FlashAttention-3 for efficient attention kernels — they are optimized for H100. FlashAttention-3 explicitly optimizes for H100 and FP8/FP16. 
+GitHub
++1
+
+Transformer Engine for FP8 auto-mixed precision where safe; but keep attention softmax in fp32 or use TE’s pattern where softmax is performed in fp32 and matmuls can be fp8. Test for NaNs. 
+NVIDIA Docs
++1
+
+Model parallel & pipeline parallel (Megatron-style) combined with ZeRO works well for large models and very long contexts.
+
+TPU v5e-8 — good for JAX workloads with pjit/pmap/pallas custom kernels:
+
+Use JAX with pjit and explicit sharding; prefer pjit/pjax/pallas for custom kernels on TPUs. JAX’s SPMD sharding is powerful but requires designing the mesh. TPU v5e chips have different memory and programming models; partition weight/activations across the 8 chips. 
+Google Cloud
++1
+
+Use bfloat16 as primary dtype on TPUs. S5 complex math and some attention steps may require higher precision — keep numerically sensitive ops in float32.
+
+For TPUs, harness jax.shard_map/pjit & manual partitioning of sequence axis so you stream chunks through local cores rather than trying to hold whole sequence on one core. 
+JAX ML
+
+Choose based on your stack:
+
+If you prefer PyTorch and DeepSpeed and want to exploit FlashAttention / Transformer Engine FP8, use H100.
+
+If you prefer JAX and pjit-style partitioning and plan to write custom S5 kernels in Pallas, use TPU v5e. Both are viable; design changes differ (pjit vs ZeRO/FSDP).
+
+5) Concrete training recipe (copy/paste into your pipeline)
+
+These are must-do steps in order.
+
+Data IO & packing
+
+Memory-map the dataset; write a streaming tokenizer that can yield chunks with overlap and summary windows. Avoid reading a full 657k sequence into memory per step — stream it from disk. Use efficient tokenization with parallel workers and queue the chunks to GPU/TPU.
+
+Implement on-the-fly chunk packing to form minibatches: pack multiple chunks into a batch to maximize GPU utilization. Do not pad whole 657k to same length.
+
+Chunk processing loop (training step outline)
+
+For each batch of B documents:
+
+For each doc in batch, iterate chunks i = 0..K:
+
+Load chunk tokens x_i
+
+Run Longformer local attention over chunk x_i (chunked implementation)
+
+Pass chunk’s outputs into S5 memory: s_{i+1} = S5_step(s_i, summary(x_i))
+
+If using summary tokens: produce g_i (8–64 tokens), let these participate in global attention
+
+Save (or accumulate) loss and backprop through last L_backprop chunks only (truncated BPTT) — accumulate gradients across micro-batches
+
+Apply optimizer step after accumulations.
+
+Gradient flow & when to backprop through many chunks
+
+Keep L_backprop small initially (2–8 chunks). Every so often (e.g., every epoch or every M updates) do a long unroll that backprops through many chunks (e.g., 32–128 chunks) so S5 learns true long-range dependencies. Choose M based on GPU budget (tradeoff compute vs signal).
+
+Memory reductions
+
+Use ZeRO/FSDP (PyTorch) or pjit sharding (JAX) — shard optimizer states and parameters. This is non-negotiable for large batches or long chunks. 
+DeepSpeed
++1
+
+Gradient checkpointing / activation recomputation on transformer layers to reduce activation memory. Use reversible blocks if you want further savings (reversible residuals allow activations to be recomputed cheaply).
+
+Offload optimizer state to CPU or NVMe (DeepSpeed ZeRO-Offload) if necessary for H100 clusters.
+
+Mixed precision
+
+On H100: use FP8/FP16 where safe for GEMMs (Transformer Engine + FlashAttention-3). BUT cast QK matmul / softmax into FP32 to avoid NaNs (or use Transformer Engine wrappers that do that for you). Validate with jax_debug_nans or PyTorch anomaly checks. 
+NVIDIA Docs
++1
+
+On TPU: use bfloat16, and run softmax/any numerically sensitive ops in float32.
+
+Use FlashAttention for local attention kernels on H100 (if you are on PyTorch). FlashAttention-3 has H100 optimizations and FP8 improvements. On JAX/TPU, you'll need custom Pallas kernels. 
+GitHub
++1
+
+KV cache handling for training vs generation
+
+For training streaming chunks, don’t build a KV cache that stores everything for the whole 657k sequence. Keep only chunk-local KV or a compressed global KV (via summaries or S5 state). For generation, keep incremental KV caches but for training avoid caching across all tokens.
+
+Optimizer & LR schedule
+
+AdamW + Warmup cosine/linear schedule is standard. Use weight decay for weights except LayerNorm/bias. Use gradient clipping (e.g., 1.0). For long-context, warmup and small base LR are essential; validate with overfitting tests.
+
+Testing and verification
+
+Overfit a single chunk (tiny dataset) — must converge.
+
+S5 unit tests: verify parallel_scan equals sequential recurrence on small sequences.
+
+Longformer unit tests: chunked attention vs dense masked attention on small sequences must match within tolerance.
+
+Mixed precision tests — run a few steps with FP16/FP8 and ensure no NaNs.
+
+6) Practical design patterns and tricks for long sequences
+
+Sequential Chunk-wise Optimization (SeCO) family of ideas — split long input into chunks and solve optimization in chunk-wise manner. This reduces memory while allowing training on ultra-long contexts. Look at recent work on chunk-wise optimization for details and tradeoffs. 
+arXiv
+
+Half-life / decay in S5 — initial S5 eigenvalues should encourage stability (negative real part). Use small state dim (e.g., 64–256) in S5 to keep cost low; you can increase state dim if you need more expressive memory.
+
+Periodic global attention — allow global attention tokens every G tokens (e.g., every 16k) to compress and route information.
+
+Compression + retrieval hybrid — instead of trying to train on full 657k backprop, compress earlier chunks into a retrieval store (learned keys/values). During training you can sample relevant distant stores and attend to them.
+
+Recomputation + Reversible layers — reversible residual blocks reduce activation memory 2x–3x (no activations stored for those blocks). If activation memory is the blocker, consider replacing some residual blocks with reversible counterparts.
+
+Stochastic depth/drop path — helps regularize when you have long contexts and fewer gradient steps spanning long ranges.
+
+7) Implementation checklist (copy/paste actionable)
+
+ Streaming tokenizer that yields chunks of size S with overlap O.
+
+ Chunk-level data pipeline that forms batches by packing multiple chunks.
+
+ Longformer chunked attention kernel integrated with FlashAttention or equivalent. (H100: use FlashAttention-3 / Transformer Engine; TPU: custom Pallas kernel.) 
+GitHub
++1
+
+ S5 module used as a recurrent state. Add options:
+
+detach state on most steps (cheap)
+
+occasionally backprop through many states (expensive)
+
+ Global/summarization tokens for each chunk (8–64 tokens).
+
+ Optimizer sharding: DeepSpeed ZeRO or FSDP (PyTorch) or pjit/sharding (JAX/TPU). 
+DeepSpeed
++1
+
+ Mixed precision policy: GEMMs in FP16/FP8 but softmax & S5-sensitive ops in FP32 / float32. Test for NaNs. 
+NVIDIA Docs
++1
+
+ Gradient checkpointing, reversible layers (optional), activation offload.
+
+ Logging/NaN detectors and unit tests: overfit single chunk, S5 parallel vs sequential equality, chunked vs masked dense attention equality.
+
+8) The “gotchas” — things that will break you if you don’t watch them
+
+Trying to backprop through all 657k tokens — you’ll run out of activation memory. Don’t do it. Use chunking + TBPTT + S5 state.
+
+Dtype/precision issues — FP16/FP8 in attention cause NaNs unless you force softmax to FP32 or use stable kernels (Transformer Engine + FlashAttention-3 handle many pitfalls but test). 
+NVIDIA Docs
++1
+
+Broadcast/einsum shape mismatches with S5 complex params — Lambda, B_tilde, C_tilde must have consistent shapes and types (complex64) prior to discretization. Add assertions. (You asked for this earlier; keep them).
+
+Chunk boundary errors — wrong overlap or wrong index for rope/position ids will kill performance. Ensure position ids for RoPE increment globally or per-chunk correctly depending on your RoPE design.
+
+KV cache explosion — caching all K/V for 657k tokens is impossible. Use compressed global memory or only chunk-local caches.
+
+Assuming the chunked implementation supports dilation — it doesn’t (unless special kernel). Don’t flip on dilation with chunked kernels. 
+GitHub
+
+Communication overhead — when you shard aggressively across devices, cross-device all-reduce and communication patterns can kill throughput if not planned (use overlap of compute and comms). ZeRO/FSDP settings must be tuned. 
+DeepSpeed
++1
+
+9) Example hyperparameter starting points (practical)
+
+S5 state dim P = 64 or 128
+
+Chunk size S = 8k tokens to start, overlap O = 1k–2k (or full window_size)
+
+Local window size w = 2k (per chunk)
+
+Summary tokens per chunk G = 16
+
+Backprop chunks L_backprop = 4 initially; intermittently run L_long = 64 every M updates
+
+AdamW with base LR 2e-4 → scale per phase; warmup 5–10% per phase; decay afterwards. (Tune.)
+
+Batch: maximize device utilization via microbatch accumulation; effective batch size depends on device. Use gradient accumulation steps until GPU memory limit.
+
+10) Practical tooling suggestions
+
+H100 (PyTorch): FlashAttention-3 + Transformer Engine + DeepSpeed ZeRO or FSDP. Use tensor parallel + pipeline as needed. Validate FP8 usage carefully. 
+GitHub
++1
+
+TPU v5e (JAX): pjit + explicit sharding, Pallas for kernels, bfloat16 dtype. Use pjit to shard the model across chips and stream the sequence axis to keep memory local. 
+JAX ML
++1
+
+11) How to validate progress (practical tests)
+
+Overfit a few examples (single doc of a few chunks): loss must drop.
+
+S5 correctness: compare recurrence vs associative_scan outputs on small runs.
+
+Chunked attention correctness: chunked vs dense masked attention equality on toy sequences.
+
+Mixed precision sanity: run a short training session under FP16/FP8 and assert no NaNs.
+
+Throughput tests: tokens/sec and memory utilization with telemetry; tune ZeRO stage and tensor parallel sizes until MFU (machine FLOPS utilization) is acceptable.
+
+12) Final bite of realism (truthful, not sugar-coated)
+
+Training to truly useful long-range dependencies across 657k tokens is expensive even with streaming. Expect to spend significant GPU/TPU hours to tune the chunking/backprop schedule and hyperparameters.
+
+You will iterate on the S5 design (state dim, update frequency) — it’s the single most important lever for long-range memory quality.
+
+If you need absolute best throughput on H100, invest in FlashAttention-3 + Transformer Engine + DeepSpeed pipeline + careful sharding. If you want the cleanest research stack and have JAX expertise, TPUs with pjit are competitive but require custom kernels and careful mesh design.

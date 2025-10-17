@@ -1,0 +1,182 @@
+# Data Pipeline Configuration
+# FineWeb dataset processing for ultra-long context training
+
+# Dataset Configuration
+dataset:
+  # HuggingFace FineWeb dataset
+  name: "HuggingFaceFW/fineweb"
+  config: "CC-MAIN-2024-10"  # Use "sample-10BT" for 10BT sample during testing
+  split: "train"
+  streaming: true
+  trust_remote_code: true
+  
+  # Alternative datasets for different experiments
+  alternatives:
+    fineweb_edu:
+      name: "HuggingFaceFW/fineweb-edu"
+      config: "default"
+    fineweb_sample:
+      name: "HuggingFaceFW/fineweb"
+      config: "sample-10BT"
+
+# Tokenization Configuration
+tokenizer:
+  # GPT-2 tokenizer (as specified in requirements)
+  tokenizer_name: "gpt2"
+  vocab_size: 50257
+  max_length: 65536
+  
+  # Token handling
+  padding_side: "right"
+  truncation_side: "right"
+  add_special_tokens: true
+  return_attention_mask: true
+  return_token_type_ids: false
+  
+  # Special tokens
+  pad_token: "<|endoftext|>"
+  eos_token: "<|endoftext|>"
+  bos_token: null
+  unk_token: "<|endoftext|>"
+
+# Chunking Strategy (for 657k token sequences)
+chunking:
+  # Chunk sizes for different training phases
+  phase_configs:
+    phase0:
+      chunk_size: 2048
+      overlap_size: 256
+      min_chunk_size: 512
+    phase1:
+      chunk_size: 8192
+      overlap_size: 512
+      min_chunk_size: 1024
+    phase2:
+      chunk_size: 32768
+      overlap_size: 2048
+      min_chunk_size: 4096
+    phase3:
+      chunk_size: 65536
+      overlap_size: 4096
+      min_chunk_size: 8192
+  
+  # Document processing
+  max_chunks_per_doc: 82  # ~657k / 8k for phase1
+  skip_short_docs: true
+  min_doc_length: 1000  # characters
+  
+  # Memory management
+  chunk_buffer_size: 1000
+  prefetch_chunks: 10
+
+# Batch Configuration
+batching:
+  # Batch sizes for different phases
+  phase_batch_sizes:
+    phase0: 16  # Smaller batches for larger chunks
+    phase1: 8
+    phase2: 4
+    phase3: 2
+  
+  # Batch processing
+  drop_last: true
+  shuffle_buffer_size: 10000
+  
+  # Padding and masking
+  pad_to_multiple_of: 8  # For TPU efficiency
+  ignore_pad_tokens_for_loss: true
+  pad_token_id: 50256  # <|endoftext|> token ID
+
+# Multi-Host Configuration (TPU v4-32)
+multi_host:
+  # Process coordination
+  shard_by_host: true
+  coordinate_hosts: true
+  
+  # Data distribution
+  data_sharding_strategy: "round_robin"  # Distribute data evenly
+  ensure_equal_batches: true  # Important for synchronous training
+  
+  # Synchronization
+  sync_every_steps: 100
+  timeout_seconds: 300
+
+# Preprocessing Pipeline
+preprocessing:
+  # Text cleaning
+  remove_empty_lines: true
+  strip_whitespace: true
+  normalize_unicode: true
+  
+  # Filtering
+  min_text_length: 100
+  max_text_length: 1000000  # 1M characters (~657k tokens)
+  
+  # Quality filtering
+  filter_low_quality: true
+  min_word_count: 50
+  max_repetition_ratio: 0.8
+
+# Caching and Storage
+caching:
+  # Tokenization caching
+  cache_tokenized: true
+  cache_dir: "./data_cache"
+  cache_size_gb: 100
+  
+  # Chunk caching
+  cache_chunks: true
+  chunk_cache_size: 50000
+  
+  # Cleanup
+  auto_cleanup_cache: true
+  cleanup_interval_hours: 24
+
+# Performance Optimization
+performance:
+  # I/O optimization
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: false  # Not applicable for TPU
+  
+  # Processing optimization
+  use_fast_tokenizer: true
+  parallel_tokenization: true
+  batch_tokenization: true
+  
+  # Memory optimization
+  lazy_loading: true
+  streaming_buffer_size: 1000
+  gc_interval: 1000  # Garbage collection interval
+
+# Monitoring and Debugging
+monitoring:
+  # Data pipeline monitoring
+  log_data_stats: true
+  log_tokenization_stats: true
+  log_chunk_stats: true
+  
+  # Performance monitoring
+  monitor_throughput: true
+  monitor_queue_sizes: true
+  monitor_memory_usage: true
+  
+  # Debugging
+  debug_mode: false
+  save_debug_samples: false
+  debug_sample_count: 10
+
+# Validation Configuration
+validation:
+  # Validation dataset
+  use_separate_validation: false  # Use same dataset with different seed
+  validation_split_ratio: 0.01
+  validation_seed: 123
+  
+  # Validation processing
+  validation_batch_size: 4
+  validation_max_chunks: 100
+  
+  # Metrics
+  compute_perplexity: true
+  compute_token_accuracy: true

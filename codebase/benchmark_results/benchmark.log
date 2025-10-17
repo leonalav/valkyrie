@@ -1,0 +1,250 @@
+2025-10-11 18:51:08,803 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:51:08,804 - __main__ - INFO - Command line: stage1_microtraining.py --verbose --output-dir ./benchmark_results
+2025-10-11 18:51:08,817 - __main__ - ERROR - JAX compilation test failed: Unable to initialize backend 'rocm': Backend 'rocm' is not in the list of known backends: ['cpu', 'tpu']. (set JAX_PLATFORMS='' to automatically choose an available backend)
+2025-10-11 18:51:08,817 - __main__ - ERROR - Environment validation failed
+2025-10-11 18:51:37,200 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:51:37,200 - __main__ - INFO - Command line: stage1_microtraining.py --verbose --output-dir ./benchmark_results
+2025-10-11 18:51:39,844 - __main__ - INFO - JAX compilation test passed
+2025-10-11 18:51:39,845 - __main__ - INFO - JAX version: 0.7.2
+2025-10-11 18:51:39,845 - __main__ - INFO - JAX backend: tpu
+2025-10-11 18:51:39,845 - __main__ - INFO - Available devices: 4
+2025-10-11 18:51:39,845 - __main__ - INFO -   Device 0: TPU_0(process=0,(0,0,0,0))
+2025-10-11 18:51:39,845 - __main__ - INFO -   Device 1: TPU_1(process=0,(1,0,0,0))
+2025-10-11 18:51:39,845 - __main__ - INFO -   Device 2: TPU_2(process=0,(0,1,0,0))
+2025-10-11 18:51:39,845 - __main__ - INFO -   Device 3: TPU_3(process=0,(1,1,0,0))
+2025-10-11 18:51:39,845 - __main__ - WARNING - No GPU devices found, using CPU
+2025-10-11 18:51:39,845 - __main__ - INFO - Device memory: {'num_allocs': 3, 'bytes_in_use': 80384, 'peak_bytes_in_use': 114688, 'largest_alloc_size': 34304, 'bytes_limit': 33014413312, 'bytes_reserved': 0, 'peak_bytes_reserved': 0, 'bytes_reservable_limit': 33014413312, 'largest_free_block_bytes': 33014298624}
+2025-10-11 18:51:39,845 - __main__ - INFO - Testing JAX operations...
+2025-10-11 18:51:40,322 - __main__ - INFO - JAX test result: 1000000000.0
+2025-10-11 18:52:16,930 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:52:16,931 - __main__ - INFO - Command line: stage1_microtraining.py --verbose --output-dir ./benchmark_results
+2025-10-11 18:52:19,434 - __main__ - INFO - JAX compilation test passed
+2025-10-11 18:52:19,435 - __main__ - INFO - JAX version: 0.7.2
+2025-10-11 18:52:19,435 - __main__ - INFO - JAX backend: tpu
+2025-10-11 18:52:19,435 - __main__ - INFO - Available devices: 4
+2025-10-11 18:52:19,435 - __main__ - INFO -   Device 0: TPU_0(process=0,(0,0,0,0))
+2025-10-11 18:52:19,435 - __main__ - INFO -   Device 1: TPU_1(process=0,(1,0,0,0))
+2025-10-11 18:52:19,435 - __main__ - INFO -   Device 2: TPU_2(process=0,(0,1,0,0))
+2025-10-11 18:52:19,436 - __main__ - INFO -   Device 3: TPU_3(process=0,(1,1,0,0))
+2025-10-11 18:52:19,436 - __main__ - WARNING - No GPU devices found, using CPU
+2025-10-11 18:52:19,436 - __main__ - INFO - Device memory: {'num_allocs': 3, 'bytes_in_use': 80384, 'peak_bytes_in_use': 114688, 'largest_alloc_size': 34304, 'bytes_limit': 33014413312, 'bytes_reserved': 0, 'peak_bytes_reserved': 0, 'bytes_reservable_limit': 33014413312, 'largest_free_block_bytes': 33014298624}
+2025-10-11 18:52:19,436 - __main__ - INFO - Testing JAX operations...
+2025-10-11 18:52:19,931 - __main__ - INFO - JAX test result: 1000000000.0
+2025-10-11 18:52:19,931 - __main__ - INFO - ================================================================================
+2025-10-11 18:52:19,931 - __main__ - INFO - STARTING BIGBIRD + S5 HYBRID EFFICIENCY BENCHMARK
+2025-10-11 18:52:19,931 - __main__ - INFO - ================================================================================
+2025-10-11 18:52:19,931 - __main__ - INFO - Configuration:
+2025-10-11 18:52:19,931 - __main__ - INFO -   Model dimension: 256
+2025-10-11 18:52:19,932 - __main__ - INFO -   Sequence length: 2048
+2025-10-11 18:52:19,932 - __main__ - INFO -   Batch size: 16
+2025-10-11 18:52:19,932 - __main__ - INFO -   Training steps: 500
+2025-10-11 18:52:19,932 - __main__ - INFO -   Learning rate: 0.0001
+2025-10-11 18:53:33,534 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:53:33,534 - __main__ - INFO - Command line: stage1_microtraining.py --verbose --output-dir ./benchmark_results
+2025-10-11 18:53:36,097 - __main__ - INFO - JAX compilation test passed
+2025-10-11 18:53:36,098 - __main__ - INFO - JAX version: 0.7.2
+2025-10-11 18:53:36,098 - __main__ - INFO - JAX backend: tpu
+2025-10-11 18:53:36,098 - __main__ - INFO - Available devices: 4
+2025-10-11 18:53:36,098 - __main__ - INFO -   Device 0: TPU_0(process=0,(0,0,0,0))
+2025-10-11 18:53:36,098 - __main__ - INFO -   Device 1: TPU_1(process=0,(1,0,0,0))
+2025-10-11 18:53:36,098 - __main__ - INFO -   Device 2: TPU_2(process=0,(0,1,0,0))
+2025-10-11 18:53:36,098 - __main__ - INFO -   Device 3: TPU_3(process=0,(1,1,0,0))
+2025-10-11 18:53:36,099 - __main__ - WARNING - No GPU devices found, using CPU
+2025-10-11 18:53:36,099 - __main__ - INFO - Device memory: {'num_allocs': 3, 'bytes_in_use': 80384, 'peak_bytes_in_use': 114688, 'largest_alloc_size': 34304, 'bytes_limit': 33014413312, 'bytes_reserved': 0, 'peak_bytes_reserved': 0, 'bytes_reservable_limit': 33014413312, 'largest_free_block_bytes': 33014298624}
+2025-10-11 18:53:36,099 - __main__ - INFO - Testing JAX operations...
+2025-10-11 18:53:36,580 - __main__ - INFO - JAX test result: 1000000000.0
+2025-10-11 18:53:36,580 - __main__ - INFO - ================================================================================
+2025-10-11 18:53:36,580 - __main__ - INFO - STARTING BIGBIRD + S5 HYBRID EFFICIENCY BENCHMARK
+2025-10-11 18:53:36,580 - __main__ - INFO - ================================================================================
+2025-10-11 18:53:36,580 - __main__ - INFO - Configuration:
+2025-10-11 18:53:36,580 - __main__ - INFO -   Model dimension: 256
+2025-10-11 18:53:36,580 - __main__ - INFO -   Sequence length: 2048
+2025-10-11 18:53:36,580 - __main__ - INFO -   Batch size: 16
+2025-10-11 18:53:36,581 - __main__ - INFO -   Training steps: 500
+2025-10-11 18:53:36,581 - __main__ - INFO -   Learning rate: 0.0001
+2025-10-11 18:53:36,581 - __main__ - INFO -   Output directory: benchmark_results
+2025-10-11 18:53:51,606 - __main__ - ERROR - Benchmark failed with error: Module construction attributes are frozen. (https://flax.readthedocs.io/en/latest/api_reference/flax.errors.html#flax.errors.SetAttributeInModuleSetupError)
+2025-10-11 18:53:51,606 - __main__ - ERROR - Full traceback:
+Traceback (most recent call last):
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 199, in run_benchmark
+    results = run_efficiency_benchmark(config)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 380, in run_efficiency_benchmark
+    hybrid_state = initialize_model_and_state(hybrid_model, config, hybrid_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 310, in initialize_model_and_state
+    params = model.init(
+             ^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/model/hybrid_bigbird_s5.py", line 418, in __call__
+    encoder_outputs = self.encode(
+                      ^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/model/hybrid_bigbird_s5.py", line 328, in encode
+    encoder_outputs = self.encoder(
+                      ^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/model/bigbird_attention.py", line 395, in __call__
+    hidden_states = layer(
+                    ^^^^^^
+  File "/home/ravkeave/v1/codebase/src/model/bigbird_attention.py", line 341, in __call__
+    ffn_output = self.feed_forward(hidden_states, training=training)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/model/bigbird_attention.py", line 242, in setup
+    self.intermediate_size = self.intermediate_size or 4 * self.d_model
+    ^^^^^^^^^^^^^^^^^^^^^^
+flax.errors.SetAttributeInModuleSetupError: Module construction attributes are frozen. (https://flax.readthedocs.io/en/latest/api_reference/flax.errors.html#flax.errors.SetAttributeInModuleSetupError)
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+2025-10-11 18:53:51,607 - __main__ - ERROR - Benchmark failed!
+2025-10-11 18:54:22,744 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:54:22,744 - __main__ - INFO - Command line: stage1_microtraining.py --verbose --output-dir ./benchmark_results
+2025-10-11 18:54:25,189 - __main__ - INFO - JAX compilation test passed
+2025-10-11 18:54:25,190 - __main__ - INFO - JAX version: 0.7.2
+2025-10-11 18:54:25,190 - __main__ - INFO - JAX backend: tpu
+2025-10-11 18:54:25,190 - __main__ - INFO - Available devices: 4
+2025-10-11 18:54:25,191 - __main__ - INFO -   Device 0: TPU_0(process=0,(0,0,0,0))
+2025-10-11 18:54:25,191 - __main__ - INFO -   Device 1: TPU_1(process=0,(1,0,0,0))
+2025-10-11 18:54:25,191 - __main__ - INFO -   Device 2: TPU_2(process=0,(0,1,0,0))
+2025-10-11 18:54:25,191 - __main__ - INFO -   Device 3: TPU_3(process=0,(1,1,0,0))
+2025-10-11 18:54:25,191 - __main__ - WARNING - No GPU devices found, using CPU
+2025-10-11 18:54:25,191 - __main__ - INFO - Device memory: {'num_allocs': 3, 'bytes_in_use': 80384, 'peak_bytes_in_use': 114688, 'largest_alloc_size': 34304, 'bytes_limit': 33014413312, 'bytes_reserved': 0, 'peak_bytes_reserved': 0, 'bytes_reservable_limit': 33014413312, 'largest_free_block_bytes': 33014298624}
+2025-10-11 18:54:25,191 - __main__ - INFO - Testing JAX operations...
+2025-10-11 18:54:25,676 - __main__ - INFO - JAX test result: 1000000000.0
+2025-10-11 18:54:25,676 - __main__ - INFO - ================================================================================
+2025-10-11 18:54:25,676 - __main__ - INFO - STARTING BIGBIRD + S5 HYBRID EFFICIENCY BENCHMARK
+2025-10-11 18:54:25,676 - __main__ - INFO - ================================================================================
+2025-10-11 18:54:25,676 - __main__ - INFO - Configuration:
+2025-10-11 18:54:25,676 - __main__ - INFO -   Model dimension: 256
+2025-10-11 18:54:25,676 - __main__ - INFO -   Sequence length: 2048
+2025-10-11 18:54:25,676 - __main__ - INFO -   Batch size: 16
+2025-10-11 18:54:25,676 - __main__ - INFO -   Training steps: 500
+2025-10-11 18:54:25,676 - __main__ - INFO -   Learning rate: 0.0001
+2025-10-11 18:54:25,677 - __main__ - INFO -   Output directory: benchmark_results
+2025-10-11 18:55:08,738 - src.benchmark.training_loop - INFO - Generating synthetic training data...
+2025-10-11 18:55:20,935 - src.benchmark.training_loop - INFO - JIT compiling training functions...
+2025-10-11 18:55:21,100 - __main__ - ERROR - Benchmark failed with error: Error interpreting argument to <function train_step_hybrid at 0x7f17ecdc9760> as an abstract array. The problematic value is of type <class 'src.benchmark.profiler_utils.ProfileMetrics'> and was passed to the function at path state.step_metrics.
+This typically means that a jit-wrapped function was called with a non-array argument, and this argument was not marked as static using the static_argnums or static_argnames parameters of jax.jit.
+2025-10-11 18:55:21,100 - __main__ - ERROR - Full traceback:
+Traceback (most recent call last):
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 199, in run_benchmark
+    results = run_efficiency_benchmark(config)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 403, in run_efficiency_benchmark
+    _, hybrid_compile_time = hybrid_profiler.profile_compilation(
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/profiler_utils.py", line 267, in profile_compilation
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+TypeError: Error interpreting argument to <function train_step_hybrid at 0x7f17ecdc9760> as an abstract array. The problematic value is of type <class 'src.benchmark.profiler_utils.ProfileMetrics'> and was passed to the function at path state.step_metrics.
+This typically means that a jit-wrapped function was called with a non-array argument, and this argument was not marked as static using the static_argnums or static_argnames parameters of jax.jit.
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+2025-10-11 18:55:21,101 - __main__ - ERROR - Benchmark failed!
+2025-10-11 18:57:23,608 - __main__ - INFO - Starting BigBird + S5 Hybrid Efficiency Benchmark
+2025-10-11 18:57:23,608 - __main__ - INFO - Command line: stage1_microtraining.py
+2025-10-11 18:57:26,128 - __main__ - INFO - JAX compilation test passed
+2025-10-11 18:57:26,129 - __main__ - INFO - JAX version: 0.7.2
+2025-10-11 18:57:26,129 - __main__ - INFO - JAX backend: tpu
+2025-10-11 18:57:26,129 - __main__ - INFO - Available devices: 4
+2025-10-11 18:57:26,129 - __main__ - INFO -   Device 0: TPU_0(process=0,(0,0,0,0))
+2025-10-11 18:57:26,129 - __main__ - INFO -   Device 1: TPU_1(process=0,(1,0,0,0))
+2025-10-11 18:57:26,129 - __main__ - INFO -   Device 2: TPU_2(process=0,(0,1,0,0))
+2025-10-11 18:57:26,130 - __main__ - INFO -   Device 3: TPU_3(process=0,(1,1,0,0))
+2025-10-11 18:57:26,130 - __main__ - WARNING - No GPU devices found, using CPU
+2025-10-11 18:57:26,130 - __main__ - INFO - Device memory: {'num_allocs': 3, 'bytes_in_use': 80384, 'peak_bytes_in_use': 114688, 'largest_alloc_size': 34304, 'bytes_limit': 33014413312, 'bytes_reserved': 0, 'peak_bytes_reserved': 0, 'bytes_reservable_limit': 33014413312, 'largest_free_block_bytes': 33014298624}
+2025-10-11 18:57:26,130 - __main__ - INFO - Testing JAX operations...
+2025-10-11 18:57:26,607 - __main__ - INFO - JAX test result: 1000000000.0
+2025-10-11 18:57:26,607 - __main__ - INFO - ================================================================================
+2025-10-11 18:57:26,607 - __main__ - INFO - STARTING BIGBIRD + S5 HYBRID EFFICIENCY BENCHMARK
+2025-10-11 18:57:26,607 - __main__ - INFO - ================================================================================
+2025-10-11 18:57:26,607 - __main__ - INFO - Configuration:
+2025-10-11 18:57:26,607 - __main__ - INFO -   Model dimension: 256
+2025-10-11 18:57:26,607 - __main__ - INFO -   Sequence length: 2048
+2025-10-11 18:57:26,607 - __main__ - INFO -   Batch size: 16
+2025-10-11 18:57:26,607 - __main__ - INFO -   Training steps: 500
+2025-10-11 18:57:26,608 - __main__ - INFO -   Learning rate: 0.0001
+2025-10-11 18:57:26,608 - __main__ - INFO -   Output directory: benchmark_results
+2025-10-11 18:58:10,553 - src.benchmark.training_loop - INFO - Generating synthetic training data...
+2025-10-11 18:58:22,560 - src.benchmark.training_loop - INFO - JIT compiling training functions...
+2025-10-11 18:58:22,721 - __main__ - ERROR - Benchmark failed with error: Non-hashable static arguments are not supported. An error occurred while trying to hash an object of type <class 'src.model.hybrid_bigbird_s5.HybridBigBirdS5Model'>, HybridBigBirdS5Model(
+    # attributes
+    config = ValkyrieConfig(vocab_size=50257, d_model=256, n_layers=32, n_heads=16, n_kv_heads=16, original_max_position_embeddings=4096, max_position_embeddings=32768, rope_theta=10000.0, yarn_beta_fast=32.0, yarn_beta_slow=1.0, attn_dropout=0.0, resid_dropout=0.0, ffn_dropout=0.1, use_bias=False, layer_norm_eps=1e-05, initializer_range=0.02, s5_state_dim=128, use_s5=True, gradient_clipping=1.0, weight_decay=0.1, gradient_checkpointing=True, use_longformer_attention=False, longformer_window_size=512, longformer_global_attention_indices=None, longformer_dilation=None, longformer_chunked=True, longformer_chunk_size=512, longformer_use_full_attention_fallback=True, longformer_combine_logits=False)
+    vocab_size = 32000
+    max_seq_len = 2048
+    num_encoder_layers = 2
+    num_decoder_layers = 1
+    encoder_num_heads = 8
+    decoder_num_heads = 8
+    s5_state_dim = 64
+    block_size = 64
+    num_random_blocks = 3
+    num_global_tokens = 2
+). The error was:
+Traceback (most recent call last):
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 324, in <module>
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 308, in main
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 199, in run_benchmark
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 401, in run_efficiency_benchmark
+  File "/home/ravkeave/v1/codebase/src/benchmark/profiler_utils.py", line 267, in profile_compilation
+  File "/home/ravkeave/.pyenv/versions/3.11.7/lib/python3.11/site-packages/flax/linen/module.py", line 733, in wrapped
+TypeError: Failed to hash Flax Module.  The module probably contains unhashable attributes.  Module=HybridBigBirdS5Model(
+    # attributes
+    config = ValkyrieConfig(vocab_size=50257, d_model=256, n_layers=32, n_heads=16, n_kv_heads=16, original_max_position_embeddings=4096, max_position_embeddings=32768, rope_theta=10000.0, yarn_beta_fast=32.0, yarn_beta_slow=1.0, attn_dropout=0.0, resid_dropout=0.0, ffn_dropout=0.1, use_bias=False, layer_norm_eps=1e-05, initializer_range=0.02, s5_state_dim=128, use_s5=True, gradient_clipping=1.0, weight_decay=0.1, gradient_checkpointing=True, use_longformer_attention=False, longformer_window_size=512, longformer_global_attention_indices=None, longformer_dilation=None, longformer_chunked=True, longformer_chunk_size=512, longformer_use_full_attention_fallback=True, longformer_combine_logits=False)
+    vocab_size = 32000
+    max_seq_len = 2048
+    num_encoder_layers = 2
+    num_decoder_layers = 1
+    encoder_num_heads = 8
+    decoder_num_heads = 8
+    s5_state_dim = 64
+    block_size = 64
+    num_random_blocks = 3
+    num_global_tokens = 2
+)
+
+2025-10-11 18:58:22,721 - __main__ - ERROR - Full traceback:
+Traceback (most recent call last):
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 199, in run_benchmark
+    results = run_efficiency_benchmark(config)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 401, in run_efficiency_benchmark
+    _, hybrid_compile_time = hybrid_profiler.profile_compilation(
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ravkeave/v1/codebase/src/benchmark/profiler_utils.py", line 267, in profile_compilation
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+ValueError: Non-hashable static arguments are not supported. An error occurred while trying to hash an object of type <class 'src.model.hybrid_bigbird_s5.HybridBigBirdS5Model'>, HybridBigBirdS5Model(
+    # attributes
+    config = ValkyrieConfig(vocab_size=50257, d_model=256, n_layers=32, n_heads=16, n_kv_heads=16, original_max_position_embeddings=4096, max_position_embeddings=32768, rope_theta=10000.0, yarn_beta_fast=32.0, yarn_beta_slow=1.0, attn_dropout=0.0, resid_dropout=0.0, ffn_dropout=0.1, use_bias=False, layer_norm_eps=1e-05, initializer_range=0.02, s5_state_dim=128, use_s5=True, gradient_clipping=1.0, weight_decay=0.1, gradient_checkpointing=True, use_longformer_attention=False, longformer_window_size=512, longformer_global_attention_indices=None, longformer_dilation=None, longformer_chunked=True, longformer_chunk_size=512, longformer_use_full_attention_fallback=True, longformer_combine_logits=False)
+    vocab_size = 32000
+    max_seq_len = 2048
+    num_encoder_layers = 2
+    num_decoder_layers = 1
+    encoder_num_heads = 8
+    decoder_num_heads = 8
+    s5_state_dim = 64
+    block_size = 64
+    num_random_blocks = 3
+    num_global_tokens = 2
+). The error was:
+Traceback (most recent call last):
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 324, in <module>
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 308, in main
+  File "/home/ravkeave/v1/codebase/stage1_microtraining.py", line 199, in run_benchmark
+  File "/home/ravkeave/v1/codebase/src/benchmark/training_loop.py", line 401, in run_efficiency_benchmark
+  File "/home/ravkeave/v1/codebase/src/benchmark/profiler_utils.py", line 267, in profile_compilation
+  File "/home/ravkeave/.pyenv/versions/3.11.7/lib/python3.11/site-packages/flax/linen/module.py", line 733, in wrapped
+TypeError: Failed to hash Flax Module.  The module probably contains unhashable attributes.  Module=HybridBigBirdS5Model(
+    # attributes
+    config = ValkyrieConfig(vocab_size=50257, d_model=256, n_layers=32, n_heads=16, n_kv_heads=16, original_max_position_embeddings=4096, max_position_embeddings=32768, rope_theta=10000.0, yarn_beta_fast=32.0, yarn_beta_slow=1.0, attn_dropout=0.0, resid_dropout=0.0, ffn_dropout=0.1, use_bias=False, layer_norm_eps=1e-05, initializer_range=0.02, s5_state_dim=128, use_s5=True, gradient_clipping=1.0, weight_decay=0.1, gradient_checkpointing=True, use_longformer_attention=False, longformer_window_size=512, longformer_global_attention_indices=None, longformer_dilation=None, longformer_chunked=True, longformer_chunk_size=512, longformer_use_full_attention_fallback=True, longformer_combine_logits=False)
+    vocab_size = 32000
+    max_seq_len = 2048
+    num_encoder_layers = 2
+    num_decoder_layers = 1
+    encoder_num_heads = 8
+    decoder_num_heads = 8
+    s5_state_dim = 64
+    block_size = 64
+    num_random_blocks = 3
+    num_global_tokens = 2
+)
+
+2025-10-11 18:58:22,724 - __main__ - ERROR - Benchmark failed!
