@@ -18,7 +18,7 @@ cli = ArgParser()
 
 class DataProcessConfig(BaseModel):
     # ARC-1
-    dataset_dirs: List[str] = ["dataset/raw-data/ARC-AGI/data", "dataset/raw-data/ConceptARC/corpus"]
+    dataset_dirs: List[str] = ["/home/ravkeave/v1/codebase/src/hrm/dataset/raw-data/ARC-AGI/data", "/home/ravkeave/v1/codebase/src/hrm/dataset/raw-data/ConceptARC/corpus"]
     output_dir: str = "data/arc-aug-1000"
     
     # ARC-2
