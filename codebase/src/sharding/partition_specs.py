@@ -35,6 +35,10 @@ BATCH_SHARD = P(DP)       # Batch dimension sharding
 W_2D = P(MP1, MP2)        # 2D weight sharding (both dimensions)
 ATTN_2D = P(MP1, MP2)     # 2D attention weight sharding
 
+# 1D-on-x helpers (use these when use_2d_sharding=False)
+W_ROW_X = P(MP1, None)    # row-shard on x
+W_COL_X = P(None, MP1)    # col-shard on x
+
 # Activation patterns
 ACT_BATCH = P(DP, None)                    # Batch sharded activations [batch, ...]
 ACT_BATCH_SEQ = P(DP, None, None)          # [batch, seq_len, hidden]
@@ -46,9 +50,7 @@ ACT_BATCH_SEQ_HEAD = P(DP, None, MP1, None)  # [batch, seq_len, n_heads, head_di
 
 def get_embedding_specs() -> Dict[str, P]:
     """PartitionSpecs for embedding layers."""
-    return {
-        'embedding': EMBED_ROW,  # Shard vocab dimension across MP1
-    }
+    return REPLICATED
 
 
 def get_attention_specs(use_2d_sharding: bool = True) -> Dict[str, P]:
@@ -62,31 +64,18 @@ def get_attention_specs(use_2d_sharding: bool = True) -> Dict[str, P]:
         Dictionary of PartitionSpecs for attention components
     """
     if use_2d_sharding:
-        # 2D sharding for better memory distribution and scaling
-        weight_spec = W_2D
+        weight_spec = W_2D            # P('x','y') – only valid if mesh has 'y'
     else:
-        # 1D sharding for simpler setup
-        weight_spec = W_COL
+        weight_spec = W_COL_X         # 1D TP on 'x'
     
     return {
-        # Query, Key, Value projections
+        # Query, Key, Value projections (only the ones that exist in actual model)
         'q_proj': weight_spec,
         'k_proj': weight_spec, 
         'v_proj': weight_spec,
         
-        # Longformer global projections
-        'qg_proj': weight_spec,
-        'kg_proj': weight_spec,
-        'vg_proj': weight_spec,
-        
         # Output projection (use row sharding to reduce communication)
-        'o_proj': W_ROW,
-        
-        # Activations
-        'queries': ACT_BATCH_SEQ_HEAD,
-        'keys': ACT_BATCH_SEQ_HEAD,
-        'values': ACT_BATCH_SEQ_HEAD,
-        'attention_output': ACT_BATCH_SEQ,
+        'o_proj': W_ROW_X,            # row-shard on 'x'
     }
 
 
@@ -101,14 +90,11 @@ def get_ffn_specs(use_2d_sharding: bool = True) -> Dict[str, P]:
         Dictionary of PartitionSpecs for FFN components
     """
     if use_2d_sharding:
-        # 2D sharding for input projections
-        input_spec = W_2D
-        # Row sharding for output to reduce all-gather
+        input_spec  = W_2D
         output_spec = W_ROW
     else:
-        # 1D column sharding
-        input_spec = W_COL
-        output_spec = W_ROW
+        input_spec  = W_COL_X         # gate/up on 'x'
+        output_spec = W_ROW_X         # down on 'x'
     
     return {
         # SwiGLU projections
@@ -131,19 +117,8 @@ def get_s5_specs() -> Dict[str, P]:
     Use conservative sharding to maintain stability.
     """
     return {
-        # S5 parameters (keep replicated for numerical stability)
-        'Lambda_re': REPLICATED,
-        'Lambda_im': REPLICATED, 
-        'B_real': REPLICATED,
-        'B_imag': REPLICATED,
-        'C_real': REPLICATED,
-        'C_imag': REPLICATED,
-        'D': REPLICATED,
-        'log_Delta': REPLICATED,
-        
-        # S5 states (shard batch dimension only)
-        's5_state': P(DP, None),  # [batch, state_dim]
-        's5_output': ACT_BATCH_SEQ,  # [batch, seq_len, d_model]
+        # S5 layer (actual structure has single s5_layer key)
+        's5_layer': REPLICATED,  # Keep replicated for numerical stability
     }
 
 
@@ -151,7 +126,7 @@ def get_layernorm_specs() -> Dict[str, P]:
     """PartitionSpecs for layer normalization."""
     return {
         'weight': REPLICATED,  # Small parameters, keep replicated
-        'bias': REPLICATED,    # Small parameters, keep replicated
+        # Note: bias removed as it doesn't exist in actual model
     }
 
 
@@ -177,6 +152,14 @@ def get_optimizer_specs(param_spec: P) -> Dict[str, P]:
 # Model-Level Patterns
 # ============================================================================
 
+def get_hrm_specs() -> Dict[str, P]:
+    """PartitionSpecs for HRM (Hierarchical Reasoning Model) components."""
+    return {
+        'executor': REPLICATED,  # Keep HRM executor replicated for now
+        'planner': REPLICATED,   # Keep HRM planner replicated for now
+    }
+
+
 def get_model_specs(config: Any, use_2d_sharding: bool = True) -> Dict[str, Any]:
     """
     Get complete PartitionSpecs for Valkyrie model.
@@ -190,16 +173,15 @@ def get_model_specs(config: Any, use_2d_sharding: bool = True) -> Dict[str, Any]
     """
     specs = {
         # Embedding layer
-        'embedding': get_embedding_specs(),
-        
+        'embedding': {
+            'embedding': get_embedding_specs()
+            
+        },
         # Layer normalization
         'norm': get_layernorm_specs(),
-        
-        # Transformer blocks
-        'blocks': {},
     }
     
-    # Add specs for each transformer block
+    # Add specs for each transformer block (individual keys, not nested under 'blocks')
     for i in range(config.n_layers):
         block_specs = {
             'norm1': get_layernorm_specs(),
@@ -207,7 +189,7 @@ def get_model_specs(config: Any, use_2d_sharding: bool = True) -> Dict[str, Any]
         }
         
         # Attention layer
-        if config.use_longformer_attention:
+        if config.use_bigbird_attention:
             block_specs['attn'] = get_attention_specs(use_2d_sharding)
         else:
             block_specs['attn'] = get_attention_specs(use_2d_sharding)
@@ -218,36 +200,13 @@ def get_model_specs(config: Any, use_2d_sharding: bool = True) -> Dict[str, Any]
         else:
             block_specs['ffn'] = get_ffn_specs(use_2d_sharding)
         
-        specs['blocks'][f'block_{i}'] = block_specs
+        specs[f'block_{i}'] = block_specs
+    
+    # Add HRM specs if enabled
+    if hasattr(config, 'use_hrm') and config.use_hrm:
+        specs['hrm'] = get_hrm_specs()
     
     return specs
-
-
-def get_training_specs(model_specs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Get PartitionSpecs for training state (params + optimizer).
-    
-    Args:
-        model_specs: Model PartitionSpecs from get_model_specs()
-        
-    Returns:
-        Training state PartitionSpecs
-    """
-    def add_optimizer_specs(param_specs):
-        """Recursively add optimizer specs for parameters."""
-        if isinstance(param_specs, P):
-            return get_optimizer_specs(param_specs)
-        elif isinstance(param_specs, dict):
-            return {k: add_optimizer_specs(v) for k, v in param_specs.items()}
-        else:
-            return param_specs
-    
-    return {
-        'params': model_specs,
-        'opt_state': add_optimizer_specs(model_specs),
-        'step': REPLICATED,
-        'rng': REPLICATED,
-    }
 
 
 # ============================================================================
@@ -313,3 +272,31 @@ SIMPLE_1D_CONFIG = {
     'shard_embeddings': True,
     'shard_s5': False,
 }
+
+
+def get_training_specs(model_specs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Get PartitionSpecs for training state (TrainingState).
+    
+    Note: We intentionally do NOT specify opt_state sharding here.
+    The optimizer state structure depends on the specific optimizer chain
+    (e.g., optax.chain with clip_by_global_norm + adamw) and should be
+    inferred by JAX to avoid pytree structure mismatches.
+    
+    Args:
+        model_specs: Model parameter PartitionSpecs from get_model_specs()
+        
+    Returns:
+        PartitionSpecs for TrainingState fields
+    """
+    return {
+        'params': model_specs,
+        # opt_state: Intentionally omitted - let JAX infer sharding
+        'step': REPLICATED,
+        'rng': REPLICATED,
+        's5_states': REPLICATED,  # Keep S5 states replicated for now
+        'chunk_position': REPLICATED,
+        'phase_index': REPLICATED,
+        'hrm_enabled': REPLICATED,
+        'hrm_training_state': REPLICATED,
+    }

@@ -43,6 +43,10 @@ class CheckpointConfig:
     # Compression
     use_compression: bool = True
     compression_level: int = 6
+    
+    # Additional parameters from YAML config
+    save_optimizer_state: bool = True  # Whether to save optimizer state
+    async_checkpointing: bool = True  # Async checkpointing flag
 
 
 class CheckpointManager:
@@ -102,7 +106,7 @@ class CheckpointManager:
         
         if self.config.async_save:
             self.checkpointer = AsyncCheckpointer(
-                PyTreeCheckpointer(),
+                ocp.StandardCheckpointHandler(),
                 timeout_secs=300,  # 5 minute timeout
             )
         else:
@@ -305,11 +309,28 @@ class CheckpointManager:
             if 's5_states' in state and state['s5_states'] is not None:
                 checkpoint_data['s5_states'] = state['s5_states']
             
+            # HRM states (z_H, z_L) as specified in PLAN
+            if 'hrm_states' in state and state['hrm_states'] is not None:
+                checkpoint_data['hrm_states'] = state['hrm_states']
+            
+            # Individual HRM state components for backward compatibility
+            if 'z_H' in state and state['z_H'] is not None:
+                checkpoint_data['z_H'] = state['z_H']
+            
+            if 'z_L' in state and state['z_L'] is not None:
+                checkpoint_data['z_L'] = state['z_L']
+            
+            # HRM training metadata (segment info, cycle counts, etc.)
+            if 'hrm_metadata' in state:
+                checkpoint_data['hrm_metadata'] = state['hrm_metadata']
+            
             # Add metadata
             checkpoint_data['metadata'] = {
                 'checkpoint_type': checkpoint_type,
                 'process_count': self.process_count,
                 'timestamp': time.time(),
+                'has_hrm_states': 'hrm_states' in state or ('z_H' in state and 'z_L' in state),
+                'has_s5_states': 's5_states' in state,
             }
         
         return checkpoint_data
@@ -334,6 +355,21 @@ class CheckpointManager:
         
         if 's5_states' in checkpoint_data:
             state['s5_states'] = checkpoint_data['s5_states']
+        
+        # Restore HRM states as specified in PLAN
+        if 'hrm_states' in checkpoint_data:
+            state['hrm_states'] = checkpoint_data['hrm_states']
+        
+        # Restore individual HRM state components for backward compatibility
+        if 'z_H' in checkpoint_data:
+            state['z_H'] = checkpoint_data['z_H']
+        
+        if 'z_L' in checkpoint_data:
+            state['z_L'] = checkpoint_data['z_L']
+        
+        # Restore HRM training metadata
+        if 'hrm_metadata' in checkpoint_data:
+            state['hrm_metadata'] = checkpoint_data['hrm_metadata']
         
         return state
     

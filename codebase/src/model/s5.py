@@ -12,7 +12,23 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Optional, Tuple
-from .modules import ValkyrieConfig
+# Robust import to support both package-relative and direct-module usage
+try:
+    from .modules import ValkyrieConfig
+except Exception:
+    try:
+        from modules import ValkyrieConfig
+    except Exception:
+        import importlib.util
+        import os
+        import sys
+        _model_dir = os.path.dirname(os.path.abspath(__file__))
+        _modules_path = os.path.join(_model_dir, "modules.py")
+        spec = importlib.util.spec_from_file_location("modules", _modules_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["modules"] = mod
+        ValkyrieConfig = mod.ValkyrieConfig
 
 
 def construct_hippo_n_matrix(N: int) -> jnp.ndarray:
@@ -660,7 +676,7 @@ def safe_eigendecomposition(A: jnp.ndarray, eps: float = 1e-12, regularization_s
     return eigenvalues, eigenvectors, V_pinv, is_stable
 
 
-class ValkyrieS5(nn.Module):
+class S5(nn.Module):
     """
     S5 State Space Model implementation in JAX/Flax with:
     - Continuous-time parameterization (Λ, B̃, C̃, Δ)
@@ -1065,8 +1081,9 @@ class ValkyrieS5(nn.Module):
         Returns:
             dict: Current B parameter stability analysis
         """
-        # Get current complex B parameters
-        _, B_tilde, _ = self._get_complex_params()
+        # Get current complex B parameters - TRACER SAFE: Inline logic to avoid underscore method calls
+        # Construct B_tilde from learnable real/imag parts
+        B_tilde = jnp.concatenate([self.B_real + 1j * self.B_imag, self.B_real - 1j * self.B_imag], axis=0).astype(jnp.complex64)
         
         # Monitor stability
         monitoring_result = monitor_b_parameter_stability(
@@ -1098,8 +1115,20 @@ class ValkyrieS5(nn.Module):
         """
         batch_size, seq_len, d_model = u.shape
         
-        # Get current complex parameters
-        Lambda, B_tilde, C_tilde = self._get_complex_params()
+        # Get current complex parameters - TRACER SAFE: Inline logic to avoid underscore method calls
+        # Construct complex matrices from learnable real/imag parts with constrained Lambda
+        if hasattr(self, 'Lambda_unconstrained_re'):
+            # Use softplus for a smooth, non-negative value, then make it negative
+            Lambda_re_constrained = -jax.nn.softplus(self.Lambda_unconstrained_re) - self.lambda_real_negative_bias
+        else: # Fallback for random init
+            Lambda_re_constrained = self.Lambda_re
+
+        Lambda_re_full = jnp.concatenate([Lambda_re_constrained, Lambda_re_constrained])
+        Lambda_im_full = jnp.concatenate([self.Lambda_im, -self.Lambda_im])
+        Lambda = (Lambda_re_full + 1j * Lambda_im_full).astype(jnp.complex64)
+        
+        B_tilde = jnp.concatenate([self.B_real + 1j * self.B_imag, self.B_real - 1j * self.B_imag], axis=0).astype(jnp.complex64)
+        C_tilde = jnp.concatenate([self.C_real + 1j * self.C_imag, self.C_real - 1j * self.C_imag], axis=1).astype(jnp.complex64)
         
         # Get parameters with Delta clamping to prevent instability
         Delta_raw = jnp.exp(self.log_Delta)  # Ensure positive timescales
@@ -1173,3 +1202,39 @@ class ValkyrieS5(nn.Module):
             final_state = xs[:, -1, :]
             
             return ys, final_state
+
+
+class ValkyrieS5(nn.Module):
+    """Valkyrie-specific S5 wrapper that matches the expected interface."""
+    config: 'ValkyrieConfig'
+    state_dim: int
+    init_mode: str = "hippo"  # Default init mode for backward compatibility
+
+    def setup(self):
+        self.s5_layer = S5(
+            config=self.config,
+            state_dim=self.state_dim,
+            init_mode=self.init_mode,
+        )
+
+    def __call__(
+        self, 
+        x: jnp.ndarray, 
+        training: bool = False, 
+        state: Optional[jnp.ndarray] = None
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Args:
+            x: Input tensor [batch, seq_len, d_model]
+            training: Whether in training mode
+            state: Previous S5 state [batch, state_dim] or None
+            
+        Returns:
+            output: S5 output [batch, seq_len, d_model]
+            next_state: Updated S5 state [batch, state_dim]
+        """
+        # CRITICAL FIX: Always use the S5 layer's __call__ method to avoid
+        # DynamicJaxprTracer errors during gradient checkpointing.
+        # The S5 layer handles both training and inference modes internally.
+        output, final_state = self.s5_layer(x, training=training, state=state)
+        return output, final_state

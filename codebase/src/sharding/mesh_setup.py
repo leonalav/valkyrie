@@ -92,12 +92,13 @@ def get_tpu_config_from_env() -> Dict[str, Any]:
     return config
 
 
-def get_optimal_topology(device_count: int) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
+def get_optimal_topology(device_count: int, force_2d_sharding: bool = True) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
     """
     Get optimal topology and axis names for given device count.
     
     Args:
         device_count: Number of TPU devices
+        force_2d_sharding: If True, ensure at least 2D mesh with 'x' and 'z' axes for sharding compatibility
         
     Returns:
         Tuple of (topology_shape, axis_names)
@@ -106,11 +107,12 @@ def get_optimal_topology(device_count: int) -> Tuple[Tuple[int, ...], Tuple[str,
         ValueError: If device count is not supported
     """
     # Optimal topologies for TPU v4 configurations
+    # Updated to ensure 2D sharding compatibility with 'x' and 'z' axes
     topology_map = {
-        1: ((1,), ('x',)),
-        4: ((4,), ('x',)),
-        8: ((2, 4), ('x', 'y')),
-        16: ((4, 4), ('x', 'y')),
+        1: ((1, 1), ('x', 'z')) if force_2d_sharding else ((1,), ('x',)),
+        4: ((4, 1), ('x', 'z')) if force_2d_sharding else ((4,), ('x',)),
+        8: ((2, 4), ('x', 'z')) if force_2d_sharding else ((2, 4), ('x', 'y')),
+        16: ((4, 4), ('x', 'z')) if force_2d_sharding else ((4, 4), ('x', 'y')),
         32: ((4, 4, 2), ('x', 'y', 'z')),  # 4x4x2 for TPU v4-32
         64: ((4, 4, 4), ('x', 'y', 'z')),
         128: ((8, 4, 4), ('x', 'y', 'z')),
@@ -231,6 +233,11 @@ def make_mesh(device_count: Optional[int] = None,
     if device_count is None:
         device_count = env_config.get('device_count', actual_device_count)
     
+    # Ensure device_count is not None
+    if device_count is None:
+        device_count = actual_device_count
+        logger.info(f"Using all available devices: {device_count}")
+    
     if device_count > actual_device_count:
         raise ValueError(f"Requested {device_count} devices, but only {actual_device_count} available")
     
@@ -246,11 +253,11 @@ def make_mesh(device_count: Optional[int] = None,
         axis_names = env_config.get('axis_names')
     
     if topology is None or axis_names is None:
-        auto_topology, auto_axis_names = get_optimal_topology(device_count)
-        if topology is None:
-            topology = auto_topology
-        if axis_names is None:
-            axis_names = auto_axis_names
+            auto_topology, auto_axis_names = get_optimal_topology(device_count, force_2d_sharding=True)
+            if topology is None:
+                topology = auto_topology
+            if axis_names is None:
+                axis_names = auto_axis_names
     
     # Force topology if requested
     if env_config.get('force_topology') and env_config.get('topology'):

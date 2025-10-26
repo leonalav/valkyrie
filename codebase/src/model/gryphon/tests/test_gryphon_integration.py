@@ -15,14 +15,14 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gryphon_config import GryphonConfig, get_gryphon_small_config
-from gryphon_model import GryphonModel, create_gryphon_small
-from gryphon_utils import (
+from src.model.gryphon.gryphon_config import GryphonConfig, get_gryphon_small_config
+from src.model.gryphon.gryphon_model import GryphonModel, create_gryphon_small
+from src.model.gryphon.gryphon_utils import (
     create_sparse_attention_mask,
     pad_to_block_size,
     compute_attention_sparsity
 )
-from training_utils import (
+from src.model.gryphon.training_utils import (
     create_gryphon_optimizer,
     compute_gryphon_loss,
     monitor_s5_stability,

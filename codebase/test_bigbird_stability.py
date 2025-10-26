@@ -4,13 +4,21 @@ Test script to verify BigBird attention stability across different configuration
 This tests the fix for boundary condition issues in the BigBird sparse attention mechanism.
 """
 
+import pytest
 import jax
 import jax.numpy as jnp
 from src.model.gryphon.bigbird_attention import BigBirdSparseAttention
 from src.model.gryphon.gryphon_config import get_gryphon_small_config
 
-def test_configuration(seq_len, block_size, batch_size=1):
+@pytest.mark.parametrize("seq_len,block_size", [
+    (512, 64),
+    (1024, 128),
+    (2048, 64),
+    (4096, 128)
+])
+def test_configuration(seq_len, block_size):
     """Test BigBird attention with specific configuration"""
+    batch_size = 1
     print(f'\n=== Testing seq_len={seq_len}, block_size={block_size} ===')
     
     # Create config

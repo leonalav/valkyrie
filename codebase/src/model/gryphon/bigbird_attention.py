@@ -18,14 +18,58 @@ import math
 from functools import lru_cache
 import hashlib
 
-from .gryphon_config import GryphonConfig
-from .gryphon_utils import (
-    pad_to_block_size,
-    reshape_to_blocks,
-    reshape_from_blocks,
-    checkpoint_attention_block
-)
-from ..modules import RMSNorm
+# Robust imports to support both package-relative and direct-module usage
+try:
+    from .gryphon_config import GryphonConfig
+    from .gryphon_utils import (
+        pad_to_block_size,
+        reshape_to_blocks,
+        reshape_from_blocks,
+        checkpoint_attention_block,
+    )
+    from ..modules import RMSNorm
+except Exception:
+    try:
+        from gryphon_config import GryphonConfig
+        from gryphon_utils import (
+            pad_to_block_size,
+            reshape_to_blocks,
+            reshape_from_blocks,
+            checkpoint_attention_block,
+        )
+    except Exception:
+        import importlib.util
+        import os
+        import sys
+        _cur_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _load_module(_name: str, _file: str):
+            _path = os.path.join(_cur_dir, _file)
+            spec = importlib.util.spec_from_file_location(_name, _path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules[_name] = mod
+            return mod
+
+        GryphonConfig = _load_module("gryphon_config", "gryphon_config.py").GryphonConfig
+        _utils = _load_module("gryphon_utils", "gryphon_utils.py")
+        pad_to_block_size = getattr(_utils, "pad_to_block_size")
+        reshape_to_blocks = getattr(_utils, "reshape_to_blocks")
+        reshape_from_blocks = getattr(_utils, "reshape_from_blocks")
+        checkpoint_attention_block = getattr(_utils, "checkpoint_attention_block")
+
+    # modules.py for RMSNorm
+    try:
+        from modules import RMSNorm
+    except Exception:
+        import importlib.util
+        import os
+        _model_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _modules_path = os.path.join(_model_dir, "modules.py")
+        spec = importlib.util.spec_from_file_location("modules", _modules_path)
+        modules = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(modules)
+        RMSNorm = modules.RMSNorm
 
 
 # Constants matching original TensorFlow implementation
@@ -459,8 +503,7 @@ def create_band_mask_from_inputs(
     
     # Final shape validation
     expected_shape = (batch_size, 1, from_seq_len, to_seq_len)
-    assert band_mask.shape == expected_shape, \
-        f"Output shape mismatch: expected {expected_shape}, got {band_mask.shape}"
+    assert band_mask.shape == expected_shape, f"Output shape mismatch: expected {expected_shape}, got {band_mask.shape}"
     
     return band_mask
 
@@ -503,77 +546,93 @@ def create_attention_mask_from_input_mask(
 
 
 def create_rand_mask_from_inputs(
-    from_blocked_mask: jnp.ndarray,
-    to_blocked_mask: jnp.ndarray,
-    rand_attn: jnp.ndarray
+    input_or_from_blocked_mask: jnp.ndarray,
+    block_or_to_blocked_mask: Any,
+    num_or_rand_attn: Any,
+    rng_key: Optional[jnp.ndarray] = None,
+    num_heads: Optional[int] = None
 ) -> jnp.ndarray:
-    """Create random attention mask from blocked masks and random attention pattern.
+    """Create random attention mask from inputs.
     
-    Args:
-        from_blocked_mask: [batch, from_blocks, from_block_size]
-        to_blocked_mask: [batch, to_blocks, to_block_size]  
-        rand_attn: [num_heads, from_blocks, to_blocks]
-        
-    Returns:
-        Random attention mask [batch, num_heads, from_seq_len, to_seq_len]
+    Supports two call patterns:
+    - Token-level path (tests): create_rand_mask_from_inputs(input_mask, block_size, num_rand_blocks, rng_key[, num_heads])
+      Returns [batch, seq_len, seq_len] if num_heads is None, else [batch, num_heads, seq_len, seq_len].
+    - Blocked mask + per-head rand_attn path (internal): create_rand_mask_from_inputs(from_blocked_mask, to_blocked_mask, rand_attn)
+      Returns [batch, num_heads, from_seq_len, to_seq_len].
     """
-    # Shape validation
+    # Token-level path
+    if (
+        input_or_from_blocked_mask.ndim == 2 and
+        isinstance(block_or_to_blocked_mask, int) and
+        isinstance(num_or_rand_attn, int)
+    ):
+        input_mask = input_or_from_blocked_mask  # [batch, seq_len]
+        block_size = int(block_or_to_blocked_mask)
+        num_rand_blocks = int(num_or_rand_attn)
+        batch_size, seq_len = input_mask.shape
+        assert seq_len % block_size == 0, f"seq_len {seq_len} must be divisible by block_size {block_size}"
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(42)
+
+        # Build plan and block-level random mask
+        plan = get_rand_attn_plan_vectorized(seq_len, block_size, num_rand_blocks, rng_key)
+        num_blocks = seq_len // block_size
+        valid = (plan >= 0)
+        safe_indices = jnp.clip(plan, 0, num_blocks - 1)
+        one_hot = jax.nn.one_hot(safe_indices, num_blocks, dtype=jnp.int32)
+        one_hot = one_hot * valid[..., None].astype(jnp.int32)
+        block_rand_mask = (jnp.sum(one_hot, axis=1) > 0)  # [num_blocks, num_blocks]
+
+        # Expand to tokens
+        token_rand_mask = jnp.repeat(jnp.repeat(block_rand_mask.astype(jnp.int32), block_size, axis=0), block_size, axis=1)  # [seq_len, seq_len]
+
+        # Apply input validity mask
+        token_valid_mask = create_attention_mask_from_input_mask(input_mask, input_mask).astype(jnp.int32)  # [batch, seq_len, seq_len]
+        if num_heads is None:
+            return token_valid_mask * token_rand_mask[None, :, :]
+        else:
+            # Replicate across heads
+            head_mask = jnp.broadcast_to(token_rand_mask[None, None, :, :], (batch_size, num_heads, seq_len, seq_len))
+            return head_mask * token_valid_mask[:, None, :, :]
+
+    # Blocked + per-head (boolean) rand_attn path
+    from_blocked_mask = input_or_from_blocked_mask
+    to_blocked_mask = block_or_to_blocked_mask
+    rand_attn = num_or_rand_attn
+
     assert from_blocked_mask.ndim == 3, f"from_blocked_mask must be 3D, got shape {from_blocked_mask.shape}"
     assert to_blocked_mask.ndim == 3, f"to_blocked_mask must be 3D, got shape {to_blocked_mask.shape}"
     assert rand_attn.ndim == 3, f"rand_attn must be 3D, got shape {rand_attn.shape}"
-    
+
     batch_size, from_blocks, from_block_size = from_blocked_mask.shape
     batch_size_to, to_blocks, to_block_size = to_blocked_mask.shape
     num_heads, rand_from_blocks, rand_to_blocks = rand_attn.shape
-    
-    # Validate batch dimensions match
-    assert batch_size == batch_size_to, \
-        f"Batch dimensions must match: from_blocked_mask {batch_size} vs to_blocked_mask {batch_size_to}"
-    
-    # Validate block dimensions match
-    assert from_blocks == rand_from_blocks, \
-        f"from_blocks must match: from_blocked_mask {from_blocks} vs rand_attn {rand_from_blocks}"
-    assert to_blocks == rand_to_blocks, \
-        f"to_blocks must match: to_blocked_mask {to_blocks} vs rand_attn {rand_to_blocks}"
-    
+    assert batch_size == batch_size_to, "Batch dimensions must match"
+    assert from_blocks == rand_from_blocks, "from_blocks must match"
+    assert to_blocks == rand_to_blocks, "to_blocks must match"
+
     from_seq_len = from_blocks * from_block_size
     to_seq_len = to_blocks * to_block_size
-    
+
     # Initialize output mask
     rand_mask = jnp.zeros((batch_size, num_heads, from_seq_len, to_seq_len))
-    
+
+    # Fill mask per selected blocks
     for head in range(num_heads):
         for from_block in range(from_blocks):
             for to_block in range(to_blocks):
                 if rand_attn[head, from_block, to_block]:
-                    # Get block masks
                     from_block_mask = from_blocked_mask[:, from_block, :]  # [batch, from_block_size]
                     to_block_mask = to_blocked_mask[:, to_block, :]        # [batch, to_block_size]
-                    
-                    # Create block attention mask
                     block_mask = jnp.expand_dims(from_block_mask, axis=-1) * jnp.expand_dims(to_block_mask, axis=1)
-                    # [batch, from_block_size, to_block_size]
-                    
-                    # Validate block mask shape
-                    expected_block_shape = (batch_size, from_block_size, to_block_size)
-                    assert block_mask.shape == expected_block_shape, \
-                        f"Block mask shape mismatch: expected {expected_block_shape}, got {block_mask.shape}"
-                    
-                    # Place in full mask
                     from_start = from_block * from_block_size
                     from_end = from_start + from_block_size
                     to_start = to_block * to_block_size
                     to_end = to_start + to_block_size
-                    
                     rand_mask = rand_mask.at[:, head, from_start:from_end, to_start:to_end].set(block_mask)
-    
-    # Final shape validation
+
     expected_shape = (batch_size, num_heads, from_seq_len, to_seq_len)
-    assert rand_mask.shape == expected_shape, \
-        f"Output shape mismatch: expected {expected_shape}, got {rand_mask.shape}"
-    
-    return rand_mask
-    
+    assert rand_mask.shape == expected_shape, f"Output shape mismatch: expected {expected_shape}, got {rand_mask.shape}"
     return rand_mask
 
 
@@ -641,14 +700,23 @@ def bigbird_block_sparse_attention(
     # First block - full attention to first two blocks
     if from_blocks > 0:
         first_query = blocked_query_matrix[:, :, 0]  # [batch, heads, from_block_size, size_per_head]
-        first_key = jnp.concatenate([
-            blocked_key_matrix[:, :, 0],
-            blocked_key_matrix[:, :, 1]
-        ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
-        first_value = jnp.concatenate([
-            blocked_value_matrix[:, :, 0],
-            blocked_value_matrix[:, :, 1]
-        ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
+        
+        # Concatenate available key/value blocks safely
+        if to_blocks >= 2:
+            first_key = jnp.concatenate([
+                blocked_key_matrix[:, :, 0],
+                blocked_key_matrix[:, :, 1]
+            ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
+            first_value = jnp.concatenate([
+                blocked_value_matrix[:, :, 0],
+                blocked_value_matrix[:, :, 1]
+            ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
+            key_blocks_used = 2
+        else:
+            # Only one block available
+            first_key = blocked_key_matrix[:, :, 0]  # [batch, heads, to_block_size, size_per_head]
+            first_value = blocked_value_matrix[:, :, 0]  # [batch, heads, to_block_size, size_per_head]
+            key_blocks_used = 1
         
         # Compute attention scores
         first_scores = jnp.einsum('bhqd,bhkd->bhqk', first_query, first_key)
@@ -657,7 +725,7 @@ def bigbird_block_sparse_attention(
         # Apply masks
         if from_mask is not None and to_mask is not None:
             first_from_mask = from_mask[:, :, :from_block_size, :]
-            first_to_mask = to_mask[:, :, :, :2*to_block_size]
+            first_to_mask = to_mask[:, :, :, :key_blocks_used*to_block_size]
             mask = first_from_mask * first_to_mask
             first_scores = jnp.where(mask == 0, -1e9, first_scores)
         
@@ -775,8 +843,28 @@ def bigbird_block_sparse_attention(
         
         # Gather keys and values using static operations
         # Shape: [batch, num_heads, num_rand_blocks, to_block_size, size_per_head]
-        gathered_keys = blocked_key_matrix[:, :, safe_indices]  # Advanced indexing
-        gathered_values = blocked_value_matrix[:, :, safe_indices]
+        # Advanced indexing with per-head indices is not supported reliably across JAX backends.
+        # Use vmap to gather per-head random blocks deterministically.
+        # Swap head axis to front for vmap-friendly slicing: [num_heads, batch, to_blocks, to_block_size, size_per_head]
+        blocked_key_matrix_hfirst = jnp.swapaxes(blocked_key_matrix, 0, 1)
+        blocked_value_matrix_hfirst = jnp.swapaxes(blocked_value_matrix, 0, 1)
+
+        def gather_blocks_per_head(mat_h, idx_h):
+            # mat_h: [batch, to_blocks, to_block_size, size_per_head]
+            # idx_h: [num_rand_blocks]
+            return jnp.take(mat_h, idx_h, axis=1)  # [batch, num_rand_blocks, to_block_size, size_per_head]
+
+        gathered_keys_hfirst = jax.vmap(gather_blocks_per_head, in_axes=(0, 0), out_axes=0)(
+            blocked_key_matrix_hfirst, safe_indices
+        )
+        gathered_values_hfirst = jax.vmap(gather_blocks_per_head, in_axes=(0, 0), out_axes=0)(
+            blocked_value_matrix_hfirst, safe_indices
+        )
+
+        # Swap axes back to [batch, num_heads, num_rand_blocks, to_block_size, size_per_head]
+        gathered_keys = jnp.swapaxes(gathered_keys_hfirst, 0, 1)
+        gathered_values = jnp.swapaxes(gathered_values_hfirst, 0, 1)
+
         
         # Apply valid mask at block level first
         # Expand mask to match block dimensions: [1, num_heads, num_rand_blocks, 1, 1]
@@ -957,25 +1045,59 @@ class BigBirdSparseAttention(nn.Module):
         num_rand_blocks: int,
         seed: int = 42
     ) -> np.ndarray:
-        """Generate random attention pattern using pure NumPy operations."""
+        """Generate random attention indices per head and per middle from-block.
+        
+        Returns integer indices of size [num_heads, (from_blocks-4), num_rand_blocks].
+        Indices are in [0, to_blocks-1], with -1 used for padding when fewer legal
+        candidates exist. Illegal candidates (window and global blocks) are excluded:
+          - Global: 0 and (to_blocks-1)
+          - Window around block i: (i-1), i, (i+1)
+        """
         import numpy as np
         
         from_blocks = from_seq_length // from_block_size
         to_blocks = to_seq_length // to_block_size
         
+        # Number of middle blocks that use random attention (exclude first two and last two)
+        num_middle = max(0, from_blocks - 4)
+        
         # Use NumPy random state for deterministic generation
         rng = np.random.RandomState(seed)
         
-        # Generate random values for all heads and blocks at once
-        random_values = rng.uniform(0.0, 1.0, (num_heads, from_blocks, to_blocks)).astype(np.float32)
+        # Random scores for selection: [heads, middle_blocks, to_blocks]
+        random_values = rng.uniform(0.0, 1.0, (num_heads, num_middle, to_blocks)).astype(np.float32)
         
-        # Use argsort to get the rank of each position
-        ranks = np.argsort(np.argsort(-random_values, axis=-1), axis=-1)
+        # Build legality mask for each middle block against all to_blocks
+        # Shape: [middle_blocks, to_blocks]
+        legal_mask = np.ones((num_middle, to_blocks), dtype=bool)
+        for j in range(num_middle):
+            i = j + 2  # actual from-block index
+            illegal = [0, to_blocks - 1, i - 1, i, i + 1]
+            for idx in illegal:
+                if 0 <= idx < to_blocks:
+                    legal_mask[j, idx] = False
         
-        # Create mask by checking if rank is less than num_rand_blocks
-        mask = ranks < num_rand_blocks
+        # Broadcast legality mask to heads
+        legal_mask_bh = np.broadcast_to(legal_mask[None, :, :], (num_heads, num_middle, to_blocks))
         
-        return mask
+        # Mask illegal positions by setting scores to -inf, then take top-k
+        masked_values = np.where(legal_mask_bh, random_values, -np.inf)
+        
+        # Argsort descending to get top indices
+        sorted_indices = np.argsort(-masked_values, axis=-1)  # [heads, middle, to_blocks]
+        
+        # Prepare output plan with -1 padding
+        plan = -np.ones((num_heads, num_middle, num_rand_blocks), dtype=np.int32)
+        
+        # Fill plan per head and per middle block with top-k legal indices
+        for h in range(num_heads):
+            for j in range(num_middle):
+                legal_count = int(np.sum(legal_mask[j]))
+                k = min(num_rand_blocks, legal_count)
+                if k > 0:
+                    plan[h, j, :k] = sorted_indices[h, j, :k]
+        
+        return plan
 
     def _generate_rand_attn(self):
         """Generate random attention patterns for all sequence lengths."""
@@ -990,11 +1112,9 @@ class BigBirdSparseAttention(nn.Module):
             seed=42
         )
         
-        # Convert to JAX array as int32 and store as non-trainable parameter
+        # Store as a static attribute to avoid reliance on Flax variable collections
         # Note: rand_attn contains integer indices for block selection, so must be int32
-        self.rand_attn = self.variable(
-            'constants', 'rand_attn', lambda: jnp.array(rand_pattern, dtype=jnp.int32)
-        ).value
+        self.rand_attn = jnp.array(rand_pattern, dtype=jnp.int32)
     
     def _apply_rotary_embeddings(
         self,
@@ -1016,8 +1136,7 @@ class BigBirdSparseAttention(nn.Module):
         Returns:
             Tuple of (rotated_q, rotated_k)
         """
-        # Gather frequencies for current positions
-        # Use static slicing instead of dynamic indexing to avoid tracer issues
+        # Gather frequencies for current positions (uniform across batch)
         batch_size, seq_len = position_ids.shape
         cos = cos_freqs[:seq_len]  # [seq_len, head_dim//2]
         sin = sin_freqs[:seq_len]  # [seq_len, head_dim//2]
@@ -1040,6 +1159,13 @@ class BigBirdSparseAttention(nn.Module):
             k1 * cos - k2 * sin,  # First half
             k1 * sin + k2 * cos   # Second half
         ], axis=-1)
+        
+        # Skip RoPE for positions marked with negative position_ids (e.g., prepended global tokens)
+        skip_mask = (position_ids < 0)  # [batch, seq_len]
+        if jnp.any(skip_mask):
+            skip_mask = skip_mask[:, :, None, None]  # [batch, seq_len, 1, 1]
+            q_rot = jnp.where(skip_mask, q, q_rot)
+            k_rot = jnp.where(skip_mask, k, k_rot)
         
         return q_rot, k_rot
     
@@ -1073,15 +1199,18 @@ class BigBirdSparseAttention(nn.Module):
         """
         batch_size, seq_len, d_model = hidden_states.shape
         
+        # Get block size from config (accessible in __call__)
+        block_size = self.config.block_size
+        
         # Pad sequence to block size if necessary
         padded_states, original_seq_len = pad_to_block_size(
-            hidden_states, self.block_size, axis=1
+            hidden_states, block_size, axis=1
         )
         padded_seq_len = padded_states.shape[1]
         
         # Pad attention mask accordingly
         if attention_mask is not None:
-            attention_mask, _ = pad_to_block_size(attention_mask, self.block_size, axis=1)
+            attention_mask, _ = pad_to_block_size(attention_mask, block_size, axis=1)
         
         # Compute Q, K, V projections
         q = self.q_proj(padded_states)  # [batch, padded_seq_len, d_model]
@@ -1170,7 +1299,7 @@ class BigBirdSparseAttention(nn.Module):
             
             # Create band mask using the helper function
             band_mask = create_band_mask_from_inputs(
-                from_blocked_mask, to_blocked_mask, self.block_size, self.block_size, self.config.window_size
+                from_blocked_mask, to_blocked_mask, block_size, block_size, self.config.window_size
             )
         
         # Get random attention pattern for current sequence length
@@ -1181,8 +1310,8 @@ class BigBirdSparseAttention(nn.Module):
             rand_pattern = self._generate_static_rand_pattern(
                 from_seq_length=padded_seq_len,
                 to_seq_length=padded_seq_len,
-                from_block_size=self.block_size,
-                to_block_size=self.block_size,
+                from_block_size=block_size,
+                to_block_size=block_size,
                 num_heads=self.n_heads,
                 num_rand_blocks=self.num_rand_blocks
             )
@@ -1216,8 +1345,8 @@ class BigBirdSparseAttention(nn.Module):
             num_rand_blocks=self.num_rand_blocks,
             from_seq_length=padded_seq_len,
             to_seq_length=padded_seq_len,
-            from_block_size=self.block_size,
-            to_block_size=self.block_size
+            from_block_size=block_size,
+            to_block_size=block_size
         )
         
         # Reshape context layer to [batch, seq_len, d_model]
@@ -1298,3 +1427,7 @@ class BigBirdMLP(nn.Module):
         output = self.down_proj(hidden)
         
         return output
+
+
+# Alias for tests expecting BigBirdAttention class name
+BigBirdAttention = BigBirdSparseAttention

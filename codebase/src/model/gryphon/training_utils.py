@@ -18,7 +18,23 @@ import optax
 from typing import Dict, Any, Tuple, Optional, NamedTuple
 import warnings
 
-from .gryphon_config import GryphonConfig
+# Robust import to support both package-relative and direct-module usage
+try:
+    from .gryphon_config import GryphonConfig
+except Exception:
+    try:
+        from gryphon_config import GryphonConfig
+    except Exception:
+        import importlib.util
+        import os
+        import sys
+        _cur_dir = os.path.dirname(os.path.abspath(__file__))
+        _config_path = os.path.join(_cur_dir, "gryphon_config.py")
+        spec = importlib.util.spec_from_file_location("gryphon_config", _config_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["gryphon_config"] = mod
+        GryphonConfig = mod.GryphonConfig
 
 
 class GryphonTrainingState(NamedTuple):

@@ -361,10 +361,23 @@ class HRMInner(nn.Module):
             cos, sin = self.rotary_emb(total_seq_len)
             seq_info.update(cos=cos, sin=sin)
         
-        # Input embeddings
+        # Input embeddings - JAX-safe batch handling
+        inputs = batch.get('inputs') if hasattr(batch, 'get') else None
+        puzzle_identifiers = batch.get('puzzle_identifiers') if hasattr(batch, 'get') else None
+        
+        if inputs is None:
+            # If batch is a JAX-traced object, extract using tree operations
+            batch_values = jax.tree_util.tree_leaves(batch)
+            if len(batch_values) >= 1:
+                inputs = batch_values[0]  # Assume first value is inputs
+                if len(batch_values) >= 2:
+                    puzzle_identifiers = batch_values[1]  # Second value might be puzzle_identifiers
+            else:
+                raise ValueError("Cannot extract inputs from batch")
+        
         input_embeddings = self._input_embeddings(
-            batch["inputs"],
-            batch.get("puzzle_identifiers")
+            inputs,
+            puzzle_identifiers
         )
         
         # Get current states

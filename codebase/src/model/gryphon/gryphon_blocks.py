@@ -14,10 +14,52 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Optional, Tuple
 
-from .gryphon_config import GryphonConfig
-from .bigbird_attention import BigBirdSparseAttention, BigBirdMLP
-from ..s5 import ValkyrieS5
-from ..modules import RMSNorm
+# Robust imports to support both package-relative and direct-module usage
+try:
+    from .gryphon_config import GryphonConfig
+    from .bigbird_attention import BigBirdSparseAttention, BigBirdMLP
+    from ..s5 import ValkyrieS5
+    from ..modules import RMSNorm
+except Exception:
+    try:
+        from gryphon_config import GryphonConfig
+        from bigbird_attention import BigBirdSparseAttention, BigBirdMLP
+    except Exception:
+        import importlib.util, os, sys
+        _cur_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        def _load_module(_name: str, _file: str):
+            _path = os.path.join(_cur_dir, _file)
+            spec = importlib.util.spec_from_file_location(_name, _path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules[_name] = mod
+            return mod
+        
+        GryphonConfig = _load_module("gryphon_config", "gryphon_config.py").GryphonConfig
+        _bb = _load_module("bigbird_attention", "bigbird_attention.py")
+        BigBirdSparseAttention = getattr(_bb, "BigBirdSparseAttention")
+        BigBirdMLP = getattr(_bb, "BigBirdMLP")
+    
+    # Load s5.py and modules.py from src/model
+    try:
+        from s5 import ValkyrieS5
+        from modules import RMSNorm
+    except Exception:
+        import importlib.util, os
+        _model_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _s5_path = os.path.join(_model_dir, "s5.py")
+        _modules_path = os.path.join(_model_dir, "modules.py")
+        
+        spec_s5 = importlib.util.spec_from_file_location("s5", _s5_path)
+        s5mod = importlib.util.module_from_spec(spec_s5)
+        spec_s5.loader.exec_module(s5mod)
+        ValkyrieS5 = s5mod.ValkyrieS5
+        
+        spec_modules = importlib.util.spec_from_file_location("modules", _modules_path)
+        modulesmod = importlib.util.module_from_spec(spec_modules)
+        spec_modules.loader.exec_module(modulesmod)
+        RMSNorm = modulesmod.RMSNorm
 
 
 class GlobalTokenCoupling(nn.Module):
@@ -258,17 +300,12 @@ class BigBirdBlock(nn.Module):
             sin_freqs: RoPE sine frequencies
             causal: Whether to apply causal masking
             training: Whether in training mode
-            
-        Returns:
-            Block output [batch, seq_len, d_model]
         """
-        # === Attention Sub-block ===
-        
         # Pre-normalization
         normed_input = self.attention_norm(hidden_states)
         
         # Sparse attention
-        attention_output = self.attention(
+        attn_output = self.attention(
             normed_input,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -278,177 +315,35 @@ class BigBirdBlock(nn.Module):
             training=training
         )
         
-        # Apply dropout and residual connection
         if training:
-            attention_output = self.attn_dropout(attention_output)
+            attn_output = self.attn_dropout(attn_output)
         
-        hidden_states = hidden_states + attention_output
+        # Residual connection
+        hidden_states = hidden_states + attn_output
         
-        # === Feed-Forward Sub-block ===
+        # Feed-forward network with pre-norm
+        ffn_input = self.ffn_norm(hidden_states)
+        ffn_output = self.mlp(ffn_input, training=training)
         
-        # Pre-normalization
-        normed_input = self.ffn_norm(hidden_states)
-        
-        # MLP
-        ffn_output = self.mlp(normed_input, training=training)
-        
-        # Apply dropout and residual connection
         if training:
             ffn_output = self.ffn_dropout(ffn_output)
         
+        # Residual connection
         output = hidden_states + ffn_output
         
         return output
 
 
-class GryphonBlock(nn.Module):
-    """Hybrid Gryphon block combining S5 and BigBird processing.
-    
-    Implements Blueprint A: S5 → BigBird sequential processing.
-    
-    Information flow:
-    1. S5 processes sequence for local/temporal feature extraction
-    2. BigBird applies sparse global attention for information routing
-    
-    This creates a powerful synergy:
-    - S5 enriches each token with contextual information
-    - BigBird routes and compares these enriched representations globally
-    """
-    
-    config: GryphonConfig
-    
-    def setup(self):
-        """Initialize hybrid block components."""
-        # S5 processing block
-        self.s5_block = S5Block(config=self.config)
-        
-        # BigBird attention block
-        self.bigbird_block = BigBirdBlock(config=self.config)
-        
-        # Global token coupling mechanism
-        if self.config.use_global_coupling:
-            self.global_coupling = GlobalTokenCoupling(config=self.config)
-        else:
-            self.global_coupling = None
-        
-        # Optional intermediate normalization for stability
-        if self.config.gradient_checkpointing:
-            self.intermediate_norm = RMSNorm(
-                hidden_size=self.config.d_model,
-                eps=self.config.layer_norm_eps
-            )
-        else:
-            self.intermediate_norm = None
-    
-    def __call__(
-        self,
-        hidden_states: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        position_ids: Optional[jnp.ndarray] = None,
-        cos_freqs: Optional[jnp.ndarray] = None,
-        sin_freqs: Optional[jnp.ndarray] = None,
-        s5_state: Optional[jnp.ndarray] = None,
-        layer_idx: int = 0,
-        causal: bool = True,
-        training: bool = True
-    ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], Optional[jnp.ndarray]]:
-        """Forward pass of Gryphon hybrid block.
-        
-        Args:
-            hidden_states: Input tensor [batch, seq_len, d_model]
-            attention_mask: Optional attention mask [batch, seq_len]
-            position_ids: Position indices [batch, seq_len]
-            cos_freqs: RoPE cosine frequencies
-            sin_freqs: RoPE sine frequencies
-            s5_state: Previous S5 state for recurrent generation
-            layer_idx: Current layer index for coupling frequency control
-            causal: Whether to apply causal masking
-            training: Whether in training mode
-            
-        Returns:
-            Tuple of (output, final_s5_state, coupling_info)
-        """
-        # === Phase 1: S5 Sequential Processing ===
-        # S5 processes the sequence to extract local/temporal features
-        # and build rich contextual representations at each position
-        
-        if self.config.use_gradient_checkpointing and training:
-            s5_output, final_s5_state = jax.checkpoint(self.s5_block)(
-                hidden_states, training=training, s5_state=s5_state
-            )
-        else:
-            s5_output, final_s5_state = self.s5_block(
-                hidden_states, training=training, s5_state=s5_state
-            )
-        
-        # Optional intermediate normalization for numerical stability
-        if self.intermediate_norm is not None:
-            s5_output = self.intermediate_norm(s5_output)
-        
-        # === Phase 2: BigBird Global Attention ===
-        # BigBird takes the S5-enriched representations and performs
-        # sparse global attention to route information across the sequence
-        
-        if self.config.use_gradient_checkpointing and training:
-            bigbird_output = jax.checkpoint(self.bigbird_block)(
-                s5_output,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cos_freqs=cos_freqs,
-                sin_freqs=sin_freqs,
-                causal=causal,
-                training=training
-            )
-        else:
-            bigbird_output = self.bigbird_block(
-                s5_output,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cos_freqs=cos_freqs,
-                sin_freqs=sin_freqs,
-                causal=causal,
-                training=training
-            )
-        
-        # === Phase 3: Global Token Coupling ===
-        # Apply global token coupling to modify S5 state for next layer
-        coupling_info = None
-        if self.global_coupling is not None:
-            modified_s5_state, coupling_info = self.global_coupling(
-                bigbird_output=bigbird_output,
-                s5_state=final_s5_state,
-                layer_idx=layer_idx,
-                training=training
-            )
-            final_s5_state = modified_s5_state
-        
-        return bigbird_output, final_s5_state, coupling_info
-
-
 class GryphonLayer(nn.Module):
-    """Complete Gryphon layer with multiple hybrid blocks.
-    
-    Allows for multiple S5 and BigBird blocks per layer for increased
-    processing depth while maintaining the hybrid architecture benefits.
-    """
+    """Hybrid Gryphon layer combining S5 and BigBird blocks."""
     
     config: GryphonConfig
     layer_idx: int
     
     def setup(self):
-        """Initialize layer components."""
-        # Create multiple Gryphon blocks per layer
-        self.gryphon_blocks = [
-            GryphonBlock(config=self.config, name=f'gryphon_block_{i}')
-            for i in range(max(1, self.config.s5_blocks_per_layer))
-        ]
-        
-        # Layer-wise learning rate scaling (optional)
-        self.layer_scale = self.param(
-            'layer_scale',
-            nn.initializers.ones,
-            (self.config.d_model,)
-        ) if hasattr(self.config, 'use_layer_scale') and self.config.use_layer_scale else None
+        self.s5_block = S5Block(config=self.config)
+        self.bigbird_block = BigBirdBlock(config=self.config)
+        self.global_coupling = GlobalTokenCoupling(config=self.config)
     
     def __call__(
         self,
@@ -461,45 +356,40 @@ class GryphonLayer(nn.Module):
         causal: bool = True,
         training: bool = True
     ) -> Tuple[jnp.ndarray, Optional[list]]:
-        """Forward pass of Gryphon layer.
+        """Forward pass of hybrid layer.
         
-        Args:
-            hidden_states: Input tensor [batch, seq_len, d_model]
-            attention_mask: Optional attention mask [batch, seq_len]
-            position_ids: Position indices [batch, seq_len]
-            cos_freqs: RoPE cosine frequencies
-            sin_freqs: RoPE sine frequencies
-            s5_states: List of S5 states for each block
-            causal: Whether to apply causal masking
-            training: Whether in training mode
-            
         Returns:
             Tuple of (output, final_s5_states)
         """
-        current_states = hidden_states
-        final_s5_states = []
+        # S5 processing
+        s5_output, final_s5_state = self.s5_block(
+            hidden_states,
+            training=training,
+            s5_state=s5_states[0] if s5_states is not None and len(s5_states) > 0 else None
+        )
         
-        # Process through each Gryphon block
-        for i, gryphon_block in enumerate(self.gryphon_blocks):
-            # Get S5 state for this block
-            block_s5_state = s5_states[i] if s5_states is not None else None
-            
-            # Forward pass
-            current_states, final_s5_state = gryphon_block(
-                current_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cos_freqs=cos_freqs,
-                sin_freqs=sin_freqs,
-                s5_state=block_s5_state,
-                causal=causal,
-                training=training
-            )
-            
-            final_s5_states.append(final_s5_state)
+        # BigBird processing
+        attn_output = self.bigbird_block(
+            s5_output,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cos_freqs=cos_freqs,
+            sin_freqs=sin_freqs,
+            causal=causal,
+            training=training
+        )
         
-        # Apply layer scaling if configured
-        if self.layer_scale is not None:
-            current_states = current_states * self.layer_scale
+        # Global token coupling
+        modified_s5_state, coupling_info = self.global_coupling(
+            attn_output,
+            s5_state=final_s5_state,
+            layer_idx=self.layer_idx,
+            training=training
+        )
         
-        return current_states, final_s5_states
+        # Return final outputs
+        return attn_output, [modified_s5_state]
+
+
+# Backward-compatibility alias: historical API exposed GryphonBlock
+GryphonBlock = GryphonLayer

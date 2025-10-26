@@ -33,6 +33,10 @@ class TokenizerConfig:
     add_special_tokens: bool = True
     return_attention_mask: bool = True
     return_token_type_ids: bool = False
+    
+    # Additional parameters from YAML config
+    tokenizer_type: str = "gpt2"  # Type of tokenizer (gpt2, sentencepiece, etc.)
+    model_max_length: int = 32768  # Maximum model length
 
 
 def create_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizerFast:

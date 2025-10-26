@@ -262,7 +262,20 @@ class HRMWithACT(nn.Module):
         Returns:
             ACTOutput with final results and Q-targets
         """
-        batch_size = batch["inputs"].shape[0]
+        # JAX-safe batch handling: modify the model signature to accept inputs directly
+        # This avoids string indexing issues in JAX-traced functions
+        inputs = batch.get('inputs') if hasattr(batch, 'get') else None
+        
+        if inputs is None:
+            # If batch is a JAX-traced object, we need to restructure the call
+            # For now, let's assume the batch structure and extract accordingly
+            batch_values = jax.tree_util.tree_leaves(batch)
+            if len(batch_values) >= 1:
+                inputs = batch_values[0]  # Assume first value is inputs
+            else:
+                raise ValueError("Cannot extract inputs from batch")
+        
+        batch_size = inputs.shape[0]
         
         # Initialize carry if not provided
         if carry is None:

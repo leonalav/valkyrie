@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Iterator, NamedTuple, Union
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class DatasetInfo(NamedTuple):
@@ -56,7 +56,7 @@ class DataConfig:
     
     # Data paths
     data_root: str = "/home/ravkeave/v1/data"
-    datasets: List[str] = ["arc-aug-1000", "maze-30x30-hard-1k", "sudoku-extreme-full"]
+    datasets: List[str] = field(default_factory=lambda: ["arc-aug-1000", "maze-30x30-hard-1k", "sudoku-extreme-full"]) 
     
     # Batching
     batch_size: int = 32

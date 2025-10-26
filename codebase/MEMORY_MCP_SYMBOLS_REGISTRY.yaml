@@ -1,0 +1,390 @@
+# Memory MCP Symbols Registry
+# Maps files → public symbols → signatures → invariants
+# Updated: 2024-12-19
+# Purpose: Track codebase public API to prevent AttributeError and keyword drift
+
+version: "1.0.0"
+last_updated: "2024-12-19"
+description: "Comprehensive registry of public symbols in BigBird+S5+HRM codebase"
+
+# Core Model Components
+model:
+  "src/model/__init__.py":
+    exports:
+      - ValkyrieConfig
+      - ValkyrieS5
+      - ValkyrieModel
+      - ValkyrieBlock
+      - ValkyrieFFN
+      - RMSNorm
+      - precompute_rope_freqs
+      - apply_rope
+    
+  "src/model/modules.py":
+    classes:
+      ValkyrieConfig:
+        type: "dataclass"
+        signature: "@dataclass class ValkyrieConfig"
+        fields:
+          - vocab_size: int = 50257
+          - d_model: int = 1536
+          - n_layers: int = 32
+          - n_heads: int = 16
+          - n_kv_heads: Optional[int] = None
+          - original_max_position_embeddings: int = 4096
+          - max_position_embeddings: int = 32768
+          - rope_theta: float = 10000.0
+          - yarn_beta_fast: float = 32.0
+          - yarn_beta_slow: float = 1.0
+          - attn_dropout: float = 0.0
+          - resid_dropout: float = 0.0
+          - ffn_dropout: float = 0.1
+          - use_bias: bool = False
+          - layer_norm_eps: float = 1e-5
+          - initializer_range: float = 0.02
+          - s5_state_dim: int = 128
+          - use_s5: bool = True
+          - gradient_clipping: float = 1.0
+          - weight_decay: float = 0.1
+          - gradient_checkpointing: bool = True
+          - use_longformer_attention: bool = False
+          - longformer_window_size: int = 512
+        invariants:
+          - "d_model % n_heads == 0"
+          - "n_heads % n_kv_heads == 0"
+          - "head_dim % 2 == 0"
+          - "head_dim <= 256"
+        
+      RMSNorm:
+        type: "flax.linen.Module"
+        signature: "class RMSNorm(nn.Module)"
+        fields:
+          - hidden_size: int
+          - eps: float = 1e-6
+        methods:
+          - setup(): "Initializes weight parameter"
+          - __call__(x: jnp.ndarray) -> jnp.ndarray: "Applies RMS normalization"
+        invariants:
+          - "Input/output shapes must match"
+          - "Uses float32 internally for numerical stability"
+    
+    functions:
+      precompute_rope_freqs:
+        signature: "precompute_rope_freqs(dim: int, max_seq_len: int, base: float = 10000.0)"
+        returns: "Tuple[jnp.ndarray, jnp.ndarray]"
+        invariants:
+          - "dim must be even"
+          - "Returns (cos_freqs, sin_freqs) with shape [max_seq_len, dim//2]"
+      
+      apply_rope:
+        signature: "apply_rope(x, cos_freqs, sin_freqs, position_ids)"
+        returns: "jnp.ndarray"
+        invariants:
+          - "x shape: [batch, seq_len, num_heads, head_dim]"
+          - "Preserves input shape"
+
+  "src/model/s5.py":
+    functions:
+      construct_hippo_n_matrix:
+        signature: "construct_hippo_n_matrix(N: int) -> jnp.ndarray"
+        returns: "jnp.ndarray"
+        invariants:
+          - "Returns lower-triangular matrix [N, N]"
+          - "For N > 16, uses block-diagonal construction"
+          - "Uses float64 precision for construction"
+      
+      monitor_b_parameter_stability:
+        signature: "monitor_b_parameter_stability(B_real, B_imag, target_max_magnitude=1.0, warning_threshold=1.5)"
+        returns: "None"
+        invariants:
+          - "B_real, B_imag shapes: [N, d_model]"
+          - "Runtime monitoring function for training stability"
+    
+    classes:
+      ValkyrieS5:
+        type: "flax.linen.Module"
+        signature: "class ValkyrieS5(nn.Module)"
+        invariants:
+          - "Implements S5 state space model"
+          - "Maintains complex arithmetic and conjugate symmetry"
+          - "Uses Zero-Order Hold discretization"
+
+# Training Infrastructure
+training:
+  "src/train/__init__.py":
+    exports:
+      - TrainingLoop
+      - create_train_step
+      - create_eval_step
+      - create_optimizer
+      - create_lr_schedule
+  
+  "src/train/train_loop.py":
+    classes:
+      ChunkConfig:
+        type: "dataclass"
+        signature: "@dataclass class ChunkConfig"
+        fields:
+          - chunk_size: int = 8192
+          - overlap_size: int = 512
+          - max_chunks_per_doc: int = 82
+          - backprop_chunks: int = 4
+          - long_backprop_every: int = 100
+          - long_backprop_chunks: int = 16
+        invariants:
+          - "chunk_size > overlap_size"
+          - "backprop_chunks <= max_chunks_per_doc"
+      
+      CurriculumConfig:
+        type: "dataclass"
+        signature: "@dataclass class CurriculumConfig"
+        fields:
+          - phases: List[Dict[str, Any]] = None
+        invariants:
+          - "phases contains progressive curriculum stages"
+          - "Each phase has: name, chunk_size, backprop_chunks, max_steps, lr"
+      
+      TrainingState:
+        type: "NamedTuple"
+        signature: "class TrainingState(NamedTuple)"
+        fields:
+          - params: Any
+          - opt_state: Any
+          - step: int
+          - rng: jax.random.PRNGKey
+          - s5_states: Optional[List[jnp.ndarray]] = None
+          - chunk_position: int = 0
+          - phase_index: int = 0
+        invariants:
+          - "Immutable training state container"
+          - "s5_states preserves inter-chunk memory"
+      
+      TrainingLoop:
+        type: "class"
+        signature: "class TrainingLoop"
+        invariants:
+          - "Implements chunked processing for ultra-long sequences"
+          - "Uses S5 as inter-chunk memory carrier"
+          - "Supports progressive curriculum"
+
+# I/O and Checkpointing
+io:
+  "src/io/__init__.py":
+    exports:
+      - CheckpointManager
+      - setup_logging
+      - get_logger
+  
+  "src/io/checkpoint.py":
+    classes:
+      CheckpointConfig:
+        type: "dataclass"
+        signature: "@dataclass class CheckpointConfig"
+        fields:
+          - checkpoint_dir: str = "./checkpoints"
+          - save_interval_steps: int = 1000
+          - keep_checkpoints: int = 5
+          - async_save: bool = True
+          - fast_checkpoint_interval: int = 100
+          - full_checkpoint_interval: int = 1000
+          - validate_on_save: bool = True
+          - validate_on_load: bool = True
+          - use_compression: bool = True
+          - compression_level: int = 6
+        invariants:
+          - "fast_checkpoint_interval <= full_checkpoint_interval"
+          - "compression_level in range [0, 9]"
+      
+      CheckpointManager:
+        type: "class"
+        signature: "class CheckpointManager"
+        methods:
+          - __init__(config, mesh=None, partition_specs=None)
+          - save_checkpoint(state, step, is_final=False)
+          - load_checkpoint(step=None)
+          - _prepare_checkpoint_data(state, is_full=True)
+          - _restore_training_state(checkpoint_data)
+        invariants:
+          - "Multi-host checkpoint coordination"
+          - "Supports HRM states (hrm_states, z_H, z_L, hrm_metadata)"
+          - "Supports S5 state persistence"
+          - "Async checkpoint operations"
+          - "Automatic cleanup of old checkpoints"
+
+# Sharding and Distribution
+sharding:
+  "src/sharding/__init__.py":
+    exports:
+      - make_mesh
+      - get_mesh_context
+      - W_2D
+      - W_ROW
+      - W_COL
+      - EMBED_ROW
+      - REPLICATED
+      - MP1
+      - MP2
+      - DP
+    
+    constants:
+      W_2D: "PartitionSpec for 2D weight sharding"
+      W_ROW: "PartitionSpec for row-wise weight sharding"
+      W_COL: "PartitionSpec for column-wise weight sharding"
+      EMBED_ROW: "PartitionSpec for embedding row sharding"
+      REPLICATED: "PartitionSpec for replication"
+      MP1: "Model parallel axis 1"
+      MP2: "Model parallel axis 2"
+      DP: "Data parallel axis"
+
+# Evaluation Suite
+evaluation:
+  "src/evaluation/__init__.py":
+    exports:
+      - AlgorithmicEvaluator
+      - AlgorithmicTask
+      - CodeTaskEvaluator
+      - CodeTask
+      - LongContextEvaluator
+      - LongContextTask
+      - HRMMetricsEvaluator
+      - HRMMetrics
+      - EvaluationSuite
+      - EvaluationConfig
+      - EvaluationResults
+  
+  "src/evaluation/evaluation_suite.py":
+    classes:
+      EvaluationConfig:
+        type: "dataclass"
+        signature: "@dataclass class EvaluationConfig"
+        invariants:
+          - "Configures evaluation parameters"
+          - "Includes task selection and HRM settings"
+      
+      EvaluationResults:
+        type: "dataclass"
+        signature: "@dataclass class EvaluationResults"
+        invariants:
+          - "Stores comprehensive evaluation metrics"
+          - "Includes algorithmic, code, long-context, and HRM metrics"
+      
+      EvaluationSuite:
+        type: "class"
+        signature: "class EvaluationSuite"
+        methods:
+          - __init__(config: EvaluationConfig)
+          - evaluate_model(model, params, tokenizer)
+          - generate_tasks()
+          - compute_hrm_metrics(model_outputs, hrm_states)
+          - save_results(results, output_dir)
+          - create_report(results)
+        invariants:
+          - "Orchestrates all evaluation components"
+          - "Provides unified interface for model evaluation"
+          - "Generates comprehensive reports"
+
+  "src/evaluation/hrm_metrics.py":
+    classes:
+      HRMMetrics:
+        type: "dataclass"
+        signature: "@dataclass class HRMMetrics"
+        fields:
+          - avg_cycles_used: float
+          - computation_efficiency: float
+          - planner_state_utilization: float
+          - executor_state_utilization: float
+          - state_persistence: float
+          - gradient_approximation_error: float
+          - one_step_gradient_quality: float
+          - act_regularizer_value: float
+          - early_stopping_rate: float
+          - reasoning_depth: float
+          - long_context_retention: float
+        invariants:
+          - "All metrics in range [0.0, 1.0] except error metrics"
+          - "Tracks HRM computational efficiency and state utilization"
+      
+      HRMMetricsEvaluator:
+        type: "class"
+        signature: "class HRMMetricsEvaluator"
+        methods:
+          - compute_metrics(model_outputs, hrm_states, targets)
+          - _compute_efficiency_metrics(hrm_states)
+          - _compute_state_utilization(hrm_states)
+          - _compute_gradient_quality(model_outputs)
+        invariants:
+          - "Evaluates HRM-specific performance metrics"
+          - "Tracks computational patterns and efficiency"
+
+# HRM Components (Legacy/Reference)
+hrm:
+  "src/hrm/evaluate.py":
+    classes:
+      EvalConfig:
+        type: "dataclass"
+        signature: "@dataclass class EvalConfig"
+        invariants:
+          - "Legacy HRM evaluation configuration"
+    
+    functions:
+      launch:
+        signature: "launch(config_path: str)"
+        invariants:
+          - "Legacy HRM evaluation launcher"
+          - "Handles distributed setup and model loading"
+
+# Utility Modules
+utils:
+  "src/utils/__init__.py":
+    exports:
+      - debug utilities
+      - test utilities
+    invariants:
+      - "Provides debugging and testing support"
+
+# API Contracts and Invariants
+contracts:
+  model_initialization:
+    - "All models must accept ValkyrieConfig"
+    - "Models must support gradient checkpointing"
+    - "S5 layers maintain state across sequences"
+  
+  training_state:
+    - "TrainingState is immutable (NamedTuple)"
+    - "S5 states persist across chunks"
+    - "HRM states (z_H, z_L) are checkpointed"
+    - "RNG keys are properly threaded"
+  
+  checkpointing:
+    - "Full checkpoints include: params, opt_state, s5_states, hrm_states"
+    - "Fast checkpoints include: params only"
+    - "Backward compatibility maintained"
+    - "Multi-host coordination required"
+  
+  evaluation:
+    - "All evaluators implement evaluate_model method"
+    - "Results are serializable dataclasses"
+    - "HRM metrics track computational efficiency"
+    - "Tasks support different difficulty levels"
+
+# Version Compatibility
+compatibility:
+  jax: ">=0.4.0"
+  flax: ">=0.7.0"
+  optax: ">=0.1.7"
+  orbax: ">=0.1.0"
+  
+# Security Notes
+security:
+  - "No secrets in checkpoint data"
+  - "Validate checkpoint integrity on load"
+  - "Sanitize file paths in checkpoint manager"
+  - "Use secure random for RNG initialization"
+
+# Performance Notes
+performance:
+  - "Use bf16/fp16 for memory efficiency"
+  - "Enable gradient checkpointing for large models"
+  - "S5 states use O(1) memory per layer"
+  - "HRM uses 1-step gradient approximation"
+  - "Async checkpointing for training throughput"

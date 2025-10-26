@@ -16,7 +16,7 @@ import optax
 from typing import Dict, Tuple, Optional, NamedTuple, Any, Callable
 import functools
 
-from model.hrm.models import HRMWithACT, ACTOutput, HRMInnerCarry, compute_act_loss
+from src.model.hrm.models import HRMWithACT, ACTOutput, HRMInnerCarry, compute_act_loss
 
 
 class HRMTrainingState(train_state.TrainState):
@@ -253,12 +253,16 @@ def compute_total_loss(
     Returns:
         Total loss and training metrics
     """
-    targets = batch["targets"]
+    targets = batch.labels if hasattr(batch, 'labels') else batch["targets"]
     
     # Language modeling loss
+    # Treat targets < 0 (e.g., -100 ignore index) as invalid and mask them out
+    valid_token_mask = (targets >= 0)
+    safe_targets = jnp.where(valid_token_mask, targets, 0)
     lm_loss, lm_metrics = compute_language_modeling_loss(
         act_output.lm_logits,
-        targets,
+        safe_targets,
+        mask=valid_token_mask.astype(jnp.float32),
         label_smoothing=loss_config.label_smoothing
     )
     
@@ -430,60 +434,72 @@ def create_train_state(
     rng_key: jax.random.PRNGKey,
     learning_rate: float,
     batch_size: int,
-    optimizer_config: Optional[Dict[str, Any]] = None
+    config: Optional[Any] = None
 ) -> HRMTrainingState:
     """
-    Create initial training state.
+    Create training state with properly initialized carry.
     
     Args:
         model: HRM model instance
         rng_key: Random key for initialization
         learning_rate: Learning rate for optimizer
         batch_size: Batch size for carry initialization
-        optimizer_config: Optional optimizer configuration
+        config: Optional config object (if not provided, uses model attributes)
         
     Returns:
-        Initial training state
+        HRMTrainingState with initialized parameters and carry
     """
-    # Default optimizer config
-    if optimizer_config is None:
-        optimizer_config = {
-            "b1": 0.9,
-            "b2": 0.95,
-            "eps": 1e-8,
-            "weight_decay": 0.1
-        }
+    # Get config from model attributes if not provided
+    if config is None:
+        # Create a config-like object from model attributes
+        class ModelConfig:
+            def __init__(self, model):
+                self.seq_len = model.seq_len
+                self.hidden_size = model.hidden_size
+                self.puzzle_emb_ndim = model.puzzle_emb_ndim
+                self.dtype = model.dtype
+        
+        config = ModelConfig(model)
     
-    # Create optimizer
-    optimizer = optax.adamw(learning_rate, **optimizer_config)
+    # Calculate total sequence length including puzzle embeddings
+    puzzle_emb_len = 0
+    if config.puzzle_emb_ndim > 0:
+        puzzle_emb_len = -(config.puzzle_emb_ndim // -config.hidden_size)  # ceil div
     
-    # Initialize model parameters
-    init_rng, carry_rng = jax.random.split(rng_key)
+    total_seq_len = config.seq_len + puzzle_emb_len
     
-    # Create dummy batch for initialization
+    # Create dummy input for parameter initialization
     dummy_batch = {
-        "inputs": jnp.ones((batch_size, model.seq_len), dtype=jnp.int32),
-        "targets": jnp.ones((batch_size, model.seq_len), dtype=jnp.int32)
+        'inputs': jnp.zeros((batch_size, config.seq_len), dtype=jnp.int32),
+        'targets': jnp.zeros((batch_size, config.seq_len), dtype=jnp.int32),
     }
     
-    # Initialize parameters
-    params = model.init(init_rng, dummy_batch, training=False)["params"]
-    
-    # Initialize carry state using model.apply with initial_carry method
-    # This ensures self.inner is available during the call
-    initial_carry = model.apply(
-        {"params": params},
-        batch_size,
-        method=model.initial_carry
+    # Initialize carry with correct total sequence length
+    init_carry = HRMInnerCarry(
+        z_H=jnp.zeros((batch_size, total_seq_len, config.hidden_size), dtype=config.dtype),
+        z_L=jnp.zeros((batch_size, total_seq_len, config.hidden_size), dtype=config.dtype)
     )
+    
+    # Initialize model parameters
+    init_key, param_key = jax.random.split(rng_key)
+    params = model.init(
+        param_key,
+        dummy_batch,
+        carry=init_carry,
+        rng_key=init_key,
+        training=True
+    )['params']
+    
+    # Create optimizer
+    optimizer = optax.adamw(learning_rate=learning_rate)
     
     # Create training state
     state = HRMTrainingState.create(
         apply_fn=model.apply,
         params=params,
         tx=optimizer,
-        carry=initial_carry,
-        rng_key=carry_rng
+        carry=init_carry,
+        rng_key=rng_key
     )
     
     return state
@@ -607,3 +623,94 @@ def validate_carry_detachment(
     except:
         # If gradient computation fails, carry is properly detached
         return True
+
+
+# Utility class to integrate HRM ACT loss into external training loops
+class HRMTrainingLoop:
+    """Lightweight wrapper to compute HRM/ACT loss and metrics for a given batch.
+    
+    This wrapper holds an HRMWithACT model and parameters initialized once,
+    and exposes a compute_hrm_loss() method that the main training loop can call
+    to obtain HRM loss and metrics per chunk/segment.
+    
+    It does NOT update HRM parameters; the intent is to provide auxiliary losses
+    and metrics alongside a primary training loop.
+    """
+    def __init__(self, hrm_model: HRMWithACT, rng_key: jax.random.PRNGKey, learning_rate: float = 1e-4, batch_size: int = 1):
+        # Create a training state to hold params and a carry for the HRM model
+        self.model = hrm_model
+        self.state = create_train_state(
+            model=hrm_model,
+            rng_key=rng_key,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+        )
+    
+    def compute_hrm_loss(
+        self,
+        params_unused: Any,
+        batch: Dict[str, jnp.ndarray],
+        phase_cfg: Dict[str, Any],
+        rng_key: Optional[jax.random.PRNGKey] = None,
+    ) -> Dict[str, Any]:
+        """Compute HRM/ACT loss for a given batch.
+        
+        Args:
+            params_unused: Unused parameter (for API compatibility with main loop)
+            batch: Dict containing 'input_ids', 'labels', and optionally 'attention_mask'
+            phase_cfg: Dict with keys like act_enabled, act_loss_weight, hrm_supervision_weight,
+                       deep_supervision_weight, hrm_one_step_gradient
+            rng_key: Optional PRNGKey for ACT exploration
+        
+        Returns:
+            Dict with 'loss' (scalar jnp.ndarray) and 'metrics' (dict of scalars)
+        """
+        # Standardize batch keys to HRMWithACT expectations
+        hrm_batch = {
+            'inputs': batch.get('input_ids'),
+            'targets': batch.get('labels'),
+        }
+        if hrm_batch['inputs'] is None or hrm_batch['targets'] is None:
+            raise ValueError("HRMTrainingLoop.compute_hrm_loss expects 'input_ids' and 'labels' in batch")
+        
+        # Prepare loss configuration
+        act_enabled = bool(phase_cfg.get('act_enabled', False))
+        loss_config = LossConfig(
+            lm_weight=1.0,
+            act_weight=(phase_cfg.get('act_loss_weight', 0.0) if act_enabled else 0.0),
+            deep_supervision_weight=phase_cfg.get('deep_supervision_weight', 0.0),
+            q_target_discount=0.95,
+            label_smoothing=0.0,
+        )
+        
+        # Forward pass through HRMWithACT
+        if rng_key is None:
+            rng_key = self.state.rng_key
+        act_output: ACTOutput = self.model.apply(
+            {'params': self.state.params},
+            hrm_batch,
+            carry=self.state.carry,
+            rng_key=rng_key,
+            training=True,
+        )
+        
+        # Compute total loss and metrics
+        total_loss, metrics = compute_total_loss(act_output, hrm_batch, loss_config)
+        
+        # Prepare metrics dict with HRM-prefixed keys to avoid collisions
+        metrics_dict = {
+            'hrm_total_loss': metrics.total_loss,
+            'hrm_lm_loss': metrics.lm_loss,
+            'hrm_act_loss': metrics.act_loss,
+            'hrm_deep_supervision_loss': metrics.deep_supervision_loss,
+            'hrm_mean_steps': metrics.mean_steps,
+            'hrm_efficiency': metrics.efficiency,
+            'hrm_early_halt_rate': metrics.early_halt_rate,
+            'hrm_q_halt_mean': metrics.q_halt_mean,
+            'hrm_q_continue_mean': metrics.q_continue_mean,
+            'hrm_q_target_mean': metrics.q_target_mean,
+            'hrm_lm_accuracy': metrics.lm_accuracy,
+            'hrm_halt_accuracy': metrics.halt_accuracy,
+        }
+        
+        return {'loss': total_loss, 'metrics': metrics_dict}

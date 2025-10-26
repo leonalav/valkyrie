@@ -1,0 +1,298 @@
+# Valkyrie TPU v4-8 Configuration
+# Optimized for 8-chip TPU v4 pod with 2D mesh topology
+
+# Include base model configuration
+model:
+  # Model architecture - Valkyrie with BigBird + S5 + HRM (Blueprint Config B: 1.2B params)
+  vocab_size: 32000   # 32k SentencePiece/BPE tokenizer
+  d_model: 1536       # Model dimension (Config B)
+  n_layers: 36        # Number of transformer layers (Config B for 1.2B params)
+  n_heads: 24         # Number of attention heads (Config B)
+  n_kv_heads: 24      # Number of key-value heads (for GQA)
+  
+  # Context and position embeddings
+  max_position_embeddings: 65536  # 64k context length
+  original_max_position_embeddings: 4096
+  rope_theta: 10000.0
+  yarn_beta_fast: 32.0
+  yarn_beta_slow: 1.0
+  
+  # Dropout rates
+  attn_dropout: 0.0
+  resid_dropout: 0.0
+  ffn_dropout: 0.1
+  
+  # Model configuration
+  use_bias: false
+  layer_norm_eps: 1.0e-5
+  initializer_range: 0.02
+  
+  # S5 configuration (State-Space Model)
+  s5_state_dim: 768   # State dimension for S5 layers (Config B)
+  use_s5: true        # Enable S5 layers
+  
+  # Training configuration
+  gradient_clipping: 1.0
+  weight_decay: 0.1
+  gradient_checkpointing: true
+  
+  # BigBird sparse attention configuration (replaces Longformer)
+  use_bigbird_attention: true
+  bigbird_block_size: 128        # Block size for 64k context (b=128)
+  bigbird_num_global_tokens: 16  # Global tokens (g=16) - used by HRM planner
+  bigbird_num_window_blocks: 3   # Window blocks (w=3)
+  bigbird_num_random_blocks: 3   # Random blocks (r=3)
+  bigbird_use_blockified_gemm: true  # Use blockified GEMM path for TPU efficiency
+  
+  # HRM (Hierarchical Reasoning Model) configuration
+  use_hrm: true
+  hrm_planner_layers: 2          # 2-layer planner Transformer
+  hrm_executor_steps: 4          # T=4 micro-updates per cycle
+  hrm_planner_update_frequency: 4 # Update planner every K=4 L-blocks
+  hrm_use_act_halting: true      # Adaptive Computation Time
+  hrm_one_step_gradient: true    # Use 1-step gradient approximation
+  hrm_deep_supervision: true     # Deep supervision between segments
+
+# TPU v4-8 Mesh Configuration
+mesh:
+  # Device configuration for TPU v4-8
+  device_count: 8
+  mesh_shape: [2, 4]  # 2×4 topology for TPU v4-8
+  axis_names: ["x", "z"]  # 2D mesh with model and data parallel axes
+  
+  # Axis mapping
+  axis_mapping:
+    x: "model_parallel"    # Tensor parallel across 2 devices
+    z: "data_parallel"     # Data parallel across 4 devices
+  
+  # Topology optimization
+  topology_type: "2d_mesh"
+  optimize_for_bisection: true
+
+# Sharding Strategy for 2D mesh
+sharding:
+  # Model parallelism (simplified for 2D)
+  model_parallel:
+    type: "1d_tensor_parallel"  # Only 1D since we have 2D mesh
+    axis: "x"
+    
+    # Weight matrix sharding patterns
+    dense_layers:
+      attention_qkv: "column"    # P('x', None) for Q/K/V projections
+      attention_out: "row"       # P('x', None) for output projection
+      ffn_gate_up: "column"      # P('x', None) for gate/up projections
+      ffn_down: "row"            # P('x', None) for down projection
+    
+    # Embedding sharding
+    embeddings:
+      vocab_embedding: "column"  # P('x', None) - shard vocab dimension
+      position_embedding: "replicated"
+  
+  # Data parallelism
+  data_parallel:
+    axis: "z"
+    batch_sharding: true
+    gradient_reduction: "pmean"
+  
+  # S5 sharding (keep stable)
+  s5_sharding:
+    parameters: "replicated"
+    states: "data_parallel"
+
+# Training Configuration (adjusted for TPU v4-8)
+training:
+  # Basic training settings
+  total_steps: 100000
+  learning_rate: 1.5e-4  # Slightly lower for smaller batch
+  warmup_steps: 5000
+  weight_decay: 0.1
+  
+  # Batch configuration
+  global_batch_size: 64   # Reduced from larger TPU config
+  micro_batch_size: 8     # 8 devices × 8 = 64 global batch
+  gradient_accumulation_steps: 1
+  
+  # Optimization
+  optimizer: "adamw"
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Learning rate schedule
+  lr_schedule: "cosine_with_warmup"
+  min_lr_ratio: 0.1
+  
+  # Mixed precision
+  use_mixed_precision: true
+  precision: "bfloat16"
+  
+  # Curriculum Learning
+  curriculum:
+    phases:
+      - name: "phase_0"
+        steps: 20000
+        chunk_size: 4096
+        lr: 1.5e-4
+        
+      - name: "phase_1" 
+        steps: 40000
+        chunk_size: 8192
+        lr: 1.2e-4
+        
+      - name: "phase_2"
+        steps: 40000
+        chunk_size: 16384
+        lr: 8.0e-5
+  
+  # System Configuration
+system:
+  # JAX configuration
+  jax_enable_x64: false  # Disable for TPU compatibility (TPU requires f32)
+  jax_debug_nans: false  # Enable only for debugging
+  jax_disable_jit: false  # Enable only for debugging
+  
+  # Memory management
+  preallocate_memory: true
+  memory_fraction: 0.9
+  
+  # Performance tuning
+  enable_async_dispatch: true
+  enable_fast_math: true
+
+# Checkpointing
+checkpointing:
+  save_every_n_steps: 1000
+  keep_n_checkpoints: 5
+  
+  # Logging
+  log_every_n_steps: 100
+  eval_every_n_steps: 1000
+
+# Tokenizer Configuration (resolves KeyError: 'tokenizer')
+tokenizer:
+  tokenizer_type: "sentencepiece"  # Use SentencePiece instead of GPT-2
+  vocab_size: 32000               # 32k vocabulary as specified in blueprint
+  model_max_length: 65536         # Match 64k context length
+  bos_token: "<s>"
+  eos_token: "</s>"
+  unk_token: "<unk>"
+  pad_token: "<pad>"
+  # SentencePiece model will be trained/loaded separately
+  add_special_tokens: true
+  padding_side: "right"
+  truncation_side: "right"
+
+# Data Configuration - Implementing Track B Performance-Oriented Plan (120-160B tokens)
+data:
+  # HuggingFace authentication
+  huggingface_token: "${HF_TOKEN}"  # Environment variable for HuggingFace token
+  
+  sources:
+    # FineWeb: 40-60B tokens (weight 0.45) - restored original weight
+    - name: "fineweb"
+      dataset: "HuggingFaceFW/fineweb"
+      config: "sample-100BT"
+      weight: 0.45  # Restored original weight
+      streaming: true
+      text_column: "text"
+      split: "train"
+      
+    # arXiv Papers: 8-12B tokens (weight 0.10) - TEXT COLUMN ONLY
+    - name: "arxiv"
+      dataset: "common-pile/arxiv_papers_filtered"
+      weight: 0.10  # Restored original weight
+      streaming: true
+      text_column: "text"  # ONLY use text column as specified
+      split: "train"
+      
+    # The Stack Dedup: 30-40B tokens (weight 0.30) - re-enabled with authentication
+    - name: "the_stack"
+      dataset: "bigcode/the-stack-dedup"
+      weight: 0.30
+      streaming: true
+      text_column: "content"
+      split: "train"
+      
+    # StarCoder Data: 15-25B tokens (weight 0.15) - re-enabled with authentication
+    - name: "starcoder"
+      dataset: "bigcode/starcoderdata"
+      data_dir: "python"  # Start with Python, expand to other languages
+      weight: 0.15
+      streaming: true  # Enable streaming for efficient memory usage
+      text_column: "content"
+      split: "train"
+  
+  # Phase-wise sampling configuration
+  phase_weights:
+    # Phase 1 (LM) sampling weights as specified - restored original weights
+    phase_1:
+      fineweb: 0.45
+      arxiv: 0.10    # Using correct name 'arxiv'
+      the_stack: 0.30
+      starcoder: 0.15
+  
+  # Training budget configuration for Track B (Performance-Oriented)
+  token_budget:
+    total_tokens: "150B"  # 150B tokens (middle of 120-160B range)
+    breakdown:
+      fineweb: "67.5B"      # 45% of 150B = 67.5B tokens (restored)
+      arxiv: "15B"          # 10% of 150B = 15B tokens (restored)
+      the_stack: "45B"      # 30% of 150B = 45B tokens (restored)
+      starcoder: "22.5B"    # 15% of 150B = 22.5B tokens (restored)
+    
+    # Phase-specific token allocation
+    phase_allocation:
+      phase_1_lm: "120B"           # Base LM training (80%)
+      phase_2_hrm_io: "20B"        # HRM I/O tasks (13.3%)
+      phase_3_act_stretch: "10B"   # ACT + long context (6.7%)
+  
+  # Tokenizer configuration (was missing, causing KeyError)
+  tokenizer_name: "gpt2"
+  vocab_size: 50257  # GPT-2 vocab size
+  
+  # Context and packing configuration for BigBird+S5
+  max_length: 65536  # 64k context for long-document training
+  pack_length: 65536
+  overlap_size: 512
+  maintain_doc_boundaries: true
+  link_segments: true  # Critical for S5 state carry-over
+  seed: 42
+  
+  # Deduplication settings (critical for Stack vs StarCoder overlap)
+  enable_deduplication: true
+  dedup_threshold: 0.8
+  repo_level_dedup: true  # Essential for code datasets
+  
+  # Long-document packing for BigBird efficiency
+  curriculum_lengths: [4096, 8192, 16384, 32768, 65536]  # 4k→64k progression
+  
+  # Span denoising for long-range routing (15-20% of batches)
+  span_denoising:
+    enabled: true
+    probability: 0.175  # 17.5% of batches
+    mask_ratio: 0.15
+    apply_to: ["fineweb", "arxiv"]  # Long documents only
+
+# Logging and Monitoring
+logging:
+  log_level: "INFO"
+  log_dir: "logs"
+  log_to_file: true
+  log_to_console: true
+  structured_logging: false
+  log_interval_steps: 100
+  eval_interval_steps: 1000
+  use_wandb: false  # Set to true if using Weights & Biases
+  wandb_project: "valkyrie-tpu-v4-8"
+    
+# Checkpointing
+checkpointing:
+  checkpoint_dir: "checkpoints"
+  save_optimizer_state: true
+  async_checkpointing: true
+
+# Validation
+validation:
+  run_s5_tests: false
+  run_attention_tests: false

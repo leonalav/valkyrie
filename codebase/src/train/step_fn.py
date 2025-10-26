@@ -98,7 +98,16 @@ def create_train_step(
                 use_cache=False,  # Don't use cache during training
                 training=True,
                 return_dict=True,
-                rngs={'dropout': dropout_rng} if config.attn_dropout > 0 or config.resid_dropout > 0 else None
+                rngs=(
+                    {
+                        'random': jax.random.fold_in(dropout_rng, state['step']),
+                        'dropout': dropout_rng
+                    }
+                    if (config.attn_dropout > 0 or config.resid_dropout > 0 or config.ffn_dropout > 0)
+                    else {
+                        'random': jax.random.fold_in(dropout_rng, state['step'])
+                    }
+                ),
             )
             
             loss = outputs['loss']
@@ -351,7 +360,16 @@ def create_chunked_train_step(
                     use_cache=True,
                     training=True,
                     return_dict=True,
-                    rngs={'dropout': dropout_rng} if config.attn_dropout > 0 else None
+                    rngs=(
+                        {
+                            'random': jax.random.fold_in(dropout_rng, chunk_idx),
+                            'dropout': dropout_rng
+                        }
+                        if (config.attn_dropout > 0 or config.resid_dropout > 0 or config.ffn_dropout > 0)
+                        else {
+                            'random': jax.random.fold_in(dropout_rng, chunk_idx)
+                        }
+                    ),
                 )
                 
                 return outputs['loss'], outputs.get('s5_states', None)

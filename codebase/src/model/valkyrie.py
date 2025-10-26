@@ -13,9 +13,10 @@ import jax.numpy as jnp
 import flax.linen as nn
 import optax
 from typing import Optional, Union, Tuple, List
-from .modules import ValkyrieConfig, RMSNorm, precompute_rope_freqs
+from .modules import ValkyrieConfig, RMSNorm, precompute_rope_freqs, TiedEmbedding
 from .s5 import ValkyrieS5
-# from .longformer import ValkyrieLongformerAttention, ValkyrieAttention, KVCache, LongformerKVCache
+from .bigbird_attention import BigBirdAttention
+from .hrm_integration import ValkyrieHRM, HRMPlannerState
 
 
 class ValkyrieFFN(nn.Module):
@@ -48,11 +49,8 @@ class ValkyrieBlock(nn.Module):
         self.norm1 = RMSNorm(self.config.d_model, eps=self.config.layer_norm_eps)
         self.norm2 = RMSNorm(self.config.d_model, eps=self.config.layer_norm_eps)
         
-        # Conditionally use Longformer attention or standard attention
-        if self.config.use_longformer_attention:
-            self.attn = ValkyrieLongformerAttention(self.config)
-        else:
-            self.attn = ValkyrieAttention(self.config)
+        # Use BigBird sparse attention
+        self.attn = BigBirdAttention(self.config)
         
         # Use S5 layer if configured, otherwise use standard FFN
         if self.config.use_s5:
@@ -69,10 +67,11 @@ class ValkyrieBlock(nn.Module):
         attention_mask: Optional[jnp.ndarray] = None,
         past_key_value: Optional[Tuple] = None,
         s5_state: Optional[jnp.ndarray] = None,
+        global_tokens: Optional[jnp.ndarray] = None,
         training: bool = False
     ) -> Tuple[jnp.ndarray, Tuple, Optional[jnp.ndarray]]:
         
-        # Attention block
+        # Attention block with global tokens (from HRM planner)
         attn_output, present_key_value = self.attn(
             self.norm1(x), 
             freqs_cos=freqs_cos,
@@ -80,6 +79,7 @@ class ValkyrieBlock(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask, 
             past_key_value=past_key_value,
+            global_tokens=global_tokens,  # Pass HRM plan tokens as global tokens
             training=training
         )
         x = x + attn_output
@@ -101,7 +101,14 @@ class ValkyrieModel(nn.Module):
     config: ValkyrieConfig
 
     def setup(self):
-        self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model)
+        self.embedding = TiedEmbedding(
+            vocab_size=self.config.vocab_size, 
+            embed_dim=self.config.d_model
+        )
+        
+        # HRM integration
+        if self.config.use_hrm:
+            self.hrm = ValkyrieHRM(self.config)
         
         # Properly register Flax submodules with explicit names
         for i in range(self.config.n_layers):
@@ -125,6 +132,7 @@ class ValkyrieModel(nn.Module):
         position_ids: Optional[jnp.ndarray] = None,
         past_key_values: Optional[List[Tuple]] = None,
         s5_states: Optional[List[jnp.ndarray]] = None,
+        hrm_state: Optional[HRMPlannerState] = None,
         use_cache: bool = False,
         labels: Optional[jnp.ndarray] = None,
         training: bool = False,
@@ -154,6 +162,19 @@ class ValkyrieModel(nn.Module):
         
         x = self.embedding(input_ids)
         
+        # HRM Planning Phase
+        global_tokens = None
+        next_hrm_state = hrm_state
+        if self.config.use_hrm and hasattr(self, 'hrm'):
+            global_tokens, enhanced_x, next_hrm_state = self.hrm(
+                x,  # input_embeddings
+                x,  # sequence_states (same as input embeddings initially)
+                hrm_state=hrm_state,
+                training=training
+            )
+            # Use enhanced states from HRM
+            x = enhanced_x
+        
         # If using cache, prepare lists to store new key-values
         next_key_values = [] if use_cache else None
         next_s5_states = [] if self.config.use_s5 else None
@@ -165,8 +186,12 @@ class ValkyrieModel(nn.Module):
             
             # Apply gradient checkpointing if needed (during training)
             if training and hasattr(self.config, 'gradient_checkpointing') and self.config.gradient_checkpointing:
-                # Use nn.remat directly on the block instance for cleaner pattern
-                x, present_key_value, next_s5_state = nn.remat(block)(
+                # Create a checkpointed version of the block's __call__ method
+                def checkpointed_block_call(x, freqs_cos, freqs_sin, position_ids, attention_mask, past_key_value, s5_state, global_tokens, training):
+                    return block(x, freqs_cos, freqs_sin, position_ids, attention_mask, past_key_value, s5_state, global_tokens, training)
+                
+                checkpointed_call = nn.remat(checkpointed_block_call)
+                x, present_key_value, next_s5_state = checkpointed_call(
                     x, 
                     freqs_cos=self.cos_freqs,
                     freqs_sin=self.sin_freqs,
@@ -174,6 +199,7 @@ class ValkyrieModel(nn.Module):
                     attention_mask=attention_mask, 
                     past_key_value=layer_past_key_value,
                     s5_state=layer_s5_state,
+                    global_tokens=global_tokens,  # Pass HRM plan tokens
                     training=training
                 )
             else:
@@ -184,6 +210,7 @@ class ValkyrieModel(nn.Module):
                                            attention_mask=attention_mask, 
                                            past_key_value=layer_past_key_value,
                                            s5_state=layer_s5_state,
+                                           global_tokens=global_tokens,  # Pass HRM plan tokens
                                            training=training)
             
             # Collect next S5 states
@@ -255,7 +282,8 @@ class ValkyrieModel(nn.Module):
             'logits': logits,
             'loss': loss,
             'past_key_values': tuple(next_key_values) if use_cache else None,
-            's5_states': tuple(next_s5_states) if self.config.use_s5 else None
+            's5_states': tuple(next_s5_states) if self.config.use_s5 else None,
+            'hrm_state': next_hrm_state if self.config.use_hrm else None
         }
 
     def generate(self,
@@ -283,10 +311,18 @@ class ValkyrieModel(nn.Module):
         initial_s5_states = [jnp.zeros((batch_size, self.config.s5_state_dim), dtype=jnp.complex64) 
                              for _ in range(self.config.n_layers)]
         
+        # Initialize HRM state
+        initial_hrm_state = None
+        if self.config.use_hrm:
+            initial_hrm_state = HRMPlannerState(
+                plan_tokens=jnp.zeros((batch_size, self.config.hrm_plan_length, self.config.d_model)),
+                step=0
+            )
+        
         # Define the scan function for generation
         def generation_step(carry, _):
             # 3. Unpack the S5 states from the carry
-            generated_ids, attention_mask, past_key_values, s5_states, rng_key = carry
+            generated_ids, attention_mask, past_key_values, s5_states, hrm_state, rng_key = carry
             
             # Get model outputs
             current_input = generated_ids if past_key_values is None else generated_ids[:, -1:]
@@ -296,6 +332,7 @@ class ValkyrieModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 s5_states=s5_states,  # <-- Pass the states here
+                hrm_state=hrm_state,  # <-- Pass HRM state
                 use_cache=True,
                 return_dict=True
             )
@@ -303,6 +340,7 @@ class ValkyrieModel(nn.Module):
             logits = outputs['logits'][:, -1, :]  # Get last token logits
             new_past_key_values = outputs['past_key_values']
             new_s5_states = outputs['s5_states']  # <-- Get the new states from the output
+            new_hrm_state = outputs['hrm_state']  # <-- Get the new HRM state
             
             # Apply repetition penalty if specified
             if repetition_penalty != 1.0:
@@ -338,12 +376,12 @@ class ValkyrieModel(nn.Module):
             ], axis=1)
             
             # 5. Pack the NEW S5 states into the next carry
-            new_carry = (new_generated_ids, new_attention_mask, new_past_key_values, new_s5_states, rng_key)
+            new_carry = (new_generated_ids, new_attention_mask, new_past_key_values, new_s5_states, new_hrm_state, rng_key)
             return new_carry, next_token
         
         # Initialize carry state
         # 2. Add S5 states to the initial carry
-        initial_carry = (input_ids, attention_mask, None, initial_s5_states, rng_key)
+        initial_carry = (input_ids, attention_mask, None, initial_s5_states, initial_hrm_state, rng_key)
         
         # Run generation scan
         final_carry, generated_tokens = jax.lax.scan(
@@ -353,7 +391,7 @@ class ValkyrieModel(nn.Module):
             length=max_new_tokens
         )
         
-        final_generated_ids, _, _, _ = final_carry
+        final_generated_ids, _, _, _, _, _ = final_carry
         
         # Handle EOS token termination (post-process if needed)
         if eos_token_id is not None:

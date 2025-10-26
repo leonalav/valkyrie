@@ -35,6 +35,18 @@ class LoggingConfig:
     log_dir: str = "./logs"
     log_to_file: bool = True
     log_to_console: bool = True
+    structured_logging: bool = False  # JSONL format
+    
+    # Metrics and monitoring
+    log_interval_steps: int = 10
+    eval_interval_steps: int = 1000
+    
+    # Performance monitoring
+    log_throughput: bool = False
+    log_memory_usage: bool = False
+    log_device_utilization: bool = False
+    log_system_metrics: bool = True
+    metrics_interval: int = 60  # seconds
     
     # Multi-host coordination
     aggregate_logs: bool = True
@@ -45,10 +57,6 @@ class LoggingConfig:
     wandb_project: str = "valkyrie-training"
     wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None
-    
-    # Performance monitoring
-    log_system_metrics: bool = True
-    metrics_interval: int = 60  # seconds
 
 
 class MultiHostLogger:

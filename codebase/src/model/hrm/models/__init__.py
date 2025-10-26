@@ -53,6 +53,13 @@ from .hrm_act import (
     compute_efficiency_metrics
 )
 
+from ..config import (
+    HRMConfig,
+    get_hrm_small_config,
+    get_hrm_base_config,
+    get_hrm_large_config
+)
+
 __all__ = [
     # Initializers
     "truncated_lecun_normal",
@@ -90,5 +97,11 @@ __all__ = [
     "ACTState",
     "ACTOutput",
     "compute_act_loss",
-    "compute_efficiency_metrics"
+    "compute_efficiency_metrics",
+    
+    # Configuration
+    "HRMConfig",
+    "get_hrm_small_config",
+    "get_hrm_base_config",
+    "get_hrm_large_config"
 ]

@@ -23,10 +23,49 @@ import flax.linen as nn
 from typing import Optional, Tuple, Dict, Any
 import math
 
-from .gryphon_config import GryphonConfig
-from .gryphon_blocks import GryphonLayer
-from .gryphon_utils import pad_to_block_size
-from ..modules import RMSNorm, precompute_rope_freqs
+# Robust imports to support both package-relative and direct-module usage
+try:
+    # Package-relative imports (when gryphon is a package)
+    from .gryphon_config import GryphonConfig
+    from .gryphon_blocks import GryphonLayer
+    from .gryphon_utils import pad_to_block_size
+    from ..modules import RMSNorm, precompute_rope_freqs
+except Exception:
+    # Fallbacks for direct module imports (pytest adds src/model/gryphon to sys.path)
+    try:
+        from gryphon_config import GryphonConfig
+        from gryphon_blocks import GryphonLayer
+        from gryphon_utils import pad_to_block_size
+    except Exception:
+        # Load from file paths if absolute imports also fail
+        import importlib.util, os, sys
+        _cur_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _load_module(_name: str, _file: str):
+            _path = os.path.join(_cur_dir, _file)
+            spec = importlib.util.spec_from_file_location(_name, _path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules[_name] = mod
+            return mod
+
+        GryphonConfig = _load_module("gryphon_config", "gryphon_config.py").GryphonConfig
+        GryphonLayer = _load_module("gryphon_blocks", "gryphon_blocks.py").GryphonLayer
+        pad_to_block_size = _load_module("gryphon_utils", "gryphon_utils.py").pad_to_block_size
+
+    # Load modules.py from src/model for RMSNorm and precompute_rope_freqs
+    try:
+        from modules import RMSNorm, precompute_rope_freqs
+    except Exception:
+        import importlib.util, os
+        _cur_dir2 = os.path.dirname(os.path.abspath(__file__))
+        _model_dir = os.path.dirname(_cur_dir2)  # src/model
+        _modules_path = os.path.join(_model_dir, "modules.py")
+        spec = importlib.util.spec_from_file_location("modules", _modules_path)
+        modules = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(modules)
+        RMSNorm = modules.RMSNorm
+        precompute_rope_freqs = modules.precompute_rope_freqs
 
 
 class GryphonEmbeddings(nn.Module):
@@ -61,7 +100,7 @@ class GryphonEmbeddings(nn.Module):
         # Store as non-trainable parameters
         self.cos_freqs = self.variable('constants', 'cos_freqs', lambda: self.cos_freqs).value
         self.sin_freqs = self.variable('constants', 'sin_freqs', lambda: self.sin_freqs).value
-    
+
     def __call__(
         self,
         input_ids: jnp.ndarray,
@@ -410,7 +449,7 @@ class GryphonModel(nn.Module):
 # Factory functions for different model sizes
 def create_gryphon_small(vocab_size: int = 50257) -> GryphonModel:
     """Create small Gryphon model for experimentation."""
-    from .gryphon_config import get_gryphon_small_config
+    from src.model.gryphon.gryphon_config import get_gryphon_small_config
     config = get_gryphon_small_config()
     config.vocab_size = vocab_size
     return GryphonModel(config=config)
@@ -418,7 +457,7 @@ def create_gryphon_small(vocab_size: int = 50257) -> GryphonModel:
 
 def create_gryphon_base(vocab_size: int = 50257) -> GryphonModel:
     """Create base Gryphon model for general use."""
-    from .gryphon_config import get_gryphon_base_config
+    from src.model.gryphon.gryphon_config import get_gryphon_base_config
     config = get_gryphon_base_config()
     config.vocab_size = vocab_size
     return GryphonModel(config=config)
@@ -426,7 +465,7 @@ def create_gryphon_base(vocab_size: int = 50257) -> GryphonModel:
 
 def create_gryphon_large(vocab_size: int = 50257) -> GryphonModel:
     """Create large Gryphon model for high-performance applications."""
-    from .gryphon_config import get_gryphon_large_config
+    from src.model.gryphon.gryphon_config import get_gryphon_large_config
     config = get_gryphon_large_config()
     config.vocab_size = vocab_size
     return GryphonModel(config=config)

@@ -48,16 +48,40 @@ class ValkyrieConfig:
     weight_decay: float = 0.1
     gradient_checkpointing: bool = True  # Enable gradient checkpointing
     
+    # BigBird attention configuration
+    use_bigbird_attention: bool = True
+    bigbird_block_size: int = 64  # Block size for sparse attention
+    bigbird_num_global_tokens: int = 64  # Number of global tokens (for HRM)
+    bigbird_num_window_blocks: int = 3  # Number of window blocks on each side
+    bigbird_num_random_blocks: int = 2  # Number of random blocks per block
+    bigbird_use_blockified_gemm: bool = True  # Use blockified GEMM for TPU efficiency
+
     # Longformer attention configuration
     use_longformer_attention: bool = False
-    longformer_window_size: int = 512  # Sliding window size
-    longformer_global_attention_indices: Optional[List[int]] = None  # Global token positions
-    longformer_dilation: Optional[int] = None  # Avoid unless custom kernel
-    longformer_chunked: bool = True  # Use chunked vectorized implementation
-    longformer_chunk_size: int = 512  # Chunk size for memory-efficient processing
-    longformer_use_full_attention_fallback: bool = True  # Use full attention for small sequences
-    longformer_combine_logits: bool = False  # Combine logits before softmax (more mathematically consistent)
+    longformer_window_size: int = 64
+    longformer_global_attention_indices: Optional[List[int]] = None
+    longformer_chunked: bool = True
+    longformer_chunk_size: int = 32
+    longformer_use_full_attention_fallback: bool = False
 
+    # HRM configuration
+    use_hrm: bool = True
+    hrm_plan_length: int = 32  # Length of HRM planning sequence
+    hrm_H_cycles: int = 3  # High-level reasoning cycles
+    hrm_L_cycles: int = 3  # Low-level reasoning cycles
+    hrm_H_layers: int = 6  # High-level transformer layers
+    hrm_L_layers: int = 6  # Low-level transformer layers
+    hrm_intermediate_size: Optional[int] = None  # FFN intermediate size for HRM
+    hrm_use_act: bool = True  # Use Adaptive Computation Time
+    hrm_act_threshold: float = 0.9  # ACT halting threshold
+    
+    # Additional HRM parameters from config
+    hrm_planner_layers: int = 2  # Number of planner layers
+    hrm_executor_steps: int = 4  # Number of executor steps
+    hrm_planner_update_frequency: int = 4  # Planner update frequency
+    hrm_use_act_halting: bool = True  # Use ACT halting
+    hrm_one_step_gradient: bool = True  # Use one-step gradient
+    hrm_deep_supervision: bool = True  # Use deep supervision
     def __post_init__(self):
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -67,6 +91,10 @@ class ValkyrieConfig:
         head_dim = self.d_model // self.n_heads
         assert head_dim % 2 == 0
         assert head_dim <= 256
+        
+        # Set HRM intermediate size if not specified
+        if self.hrm_intermediate_size is None:
+            self.hrm_intermediate_size = 4 * self.d_model
 
 
 class RMSNorm(nn.Module):
@@ -83,6 +111,69 @@ class RMSNorm(nn.Module):
         variance = jnp.mean(x**2, axis=-1, keepdims=True)
         x = x * jax.lax.rsqrt(variance + self.eps)
         return (self.weight * x).astype(input_dtype)
+
+
+class TiedEmbedding(nn.Module):
+    """Embedding layer with tied weights for output projection.
+    
+    This layer supports both embedding lookup (for input tokens) and 
+    tied weight output projection (for computing logits).
+    """
+    vocab_size: int
+    embed_dim: int
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        """Embedding lookup for input tokens."""
+        if inputs.dtype not in [jnp.int32, jnp.int64]:
+            raise ValueError(f"Input dtype must be int32 or int64, got {inputs.dtype}")
+        
+        # Define the embedding parameter
+        embedding = self.param(
+            'embedding',
+            nn.initializers.normal(stddev=0.02),
+            (self.vocab_size, self.embed_dim),
+            self.param_dtype
+        )
+        
+        # Ensure inputs are within vocabulary range
+        inputs = jnp.clip(inputs, 0, self.vocab_size - 1)
+        
+        # Perform embedding lookup
+        embeddings = embedding[inputs]
+        return embeddings.astype(self.dtype)
+
+    @nn.compact
+    def attend(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        """Output projection using tied embedding weights.
+        
+        Args:
+            inputs: Hidden states of shape [..., embed_dim]
+            
+        Returns:
+            Logits of shape [..., vocab_size]
+        """
+        # inputs: [..., embed_dim]
+        # embedding: [vocab_size, embed_dim]
+        # output: [..., vocab_size]
+        
+        # Get the same embedding parameter (Flax will reuse the same parameter)
+        embedding = self.param(
+            'embedding',
+            nn.initializers.normal(stddev=0.02),
+            (self.vocab_size, self.embed_dim),
+            self.param_dtype
+        )
+        
+        # Ensure inputs are the right dtype
+        inputs = inputs.astype(self.param_dtype)
+        
+        # Matrix multiplication: inputs @ embedding.T
+        logits = jnp.dot(inputs, embedding.T)
+        
+        return logits.astype(self.dtype)
 
 
 def precompute_rope_freqs(dim: int, max_seq_len: int, base: float = 10000.0):

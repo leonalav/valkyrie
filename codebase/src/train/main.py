@@ -17,17 +17,22 @@ import logging
 import time
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Iterator
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from model import ValkyrieModel, ValkyrieConfig
-from sharding import setup_tpu_mesh, get_model_specs, get_training_specs
-from train import TrainingLoop, ChunkConfig, CurriculumConfig
-from data import create_data_loader, FineWebConfig, TokenizerConfig, get_fineweb_edu_config, get_fineweb_tokenizer_config
-from io import CheckpointManager, CheckpointConfig, setup_logging, LoggingConfig
-from utils.debug import (
+from ..model import ValkyrieModel, ValkyrieConfig
+from ..sharding import make_mesh, get_mesh_context, get_model_specs
+from ..data.multi_source_loader import PackedSequence
+from .train_loop import TrainingLoop, ChunkConfig, CurriculumConfig
+from ..data import create_data_loader, MultiSourceConfig, MultiSourceDataLoader, DataSourceConfig, TokenizerConfig, create_plan_data_loader
+from ..io import CheckpointManager, CheckpointConfig, setup_logging, LoggingConfig
+from ..utils.debug import (
     get_tpu_mixed_precision_config, 
     MixedPrecisionPolicy,
     print_param_stats,
@@ -40,13 +45,24 @@ logger = logging.getLogger(__name__)
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
+    import os
+    import re
     
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config_text = f.read()
+    
+    # Substitute environment variables in the format ${VAR_NAME}
+    def env_var_replacer(match):
+        var_name = match.group(1)
+        return os.environ.get(var_name, match.group(0))  # Return original if not found
+    
+    config_text = re.sub(r'\$\{([^}]+)\}', env_var_replacer, config_text)
+    
+    config = yaml.safe_load(config_text)
     
     logger.info(f"Configuration loaded from: {config_path}")
     return config
@@ -59,12 +75,40 @@ def create_model_from_config(config: Dict[str, Any]) -> ValkyrieModel:
     model = ValkyrieModel(model_config)
     
     logger.info("Model created:")
-    logger.info(f"  Architecture: Longformer={model_config.use_longformer_attention}, S5={model_config.use_s5}")
+    logger.info(f"  Architecture: BigBird={model_config.use_bigbird_attention}, S5={model_config.use_s5}")
     logger.info(f"  Dimensions: d_model={model_config.d_model}, n_layers={model_config.n_layers}")
-    logger.info(f"  Attention: n_heads={model_config.n_heads}, window_size={model_config.longformer_window_size}")
+    logger.info(f"  Attention: n_heads={model_config.n_heads}, block_size={model_config.bigbird_block_size}")
     logger.info(f"  S5: state_dim={model_config.s5_state_dim}")
+    logger.info(f"  HRM: enabled={model_config.use_hrm}, plan_length={model_config.hrm_plan_length}")
     
     return model
+
+
+def convert_packed_sequences_to_batch(packed_sequences: List[PackedSequence]) -> Dict[str, jnp.ndarray]:
+    """Convert List[PackedSequence] to batch dictionary with only fields used by training.
+    
+    Args:
+        packed_sequences: List of PackedSequence namedtuples
+        
+    Returns:
+        Dictionary with only the fields used by train_step:
+        - input_ids: [batch_size, pack_length]
+    """
+    if not packed_sequences:
+        raise ValueError("Empty packed_sequences list")
+    
+    # Only stack input_ids since that's all the training code uses
+    input_ids = jnp.stack([seq.input_ids for seq in packed_sequences])
+    
+    return {
+        'input_ids': input_ids,
+    }
+
+
+def create_batch_iterator(data_loader, batch_size: int, rng_key: jax.random.PRNGKey) -> Iterator[Dict[str, jnp.ndarray]]:
+    """Create iterator that converts List[PackedSequence] to proper batch format."""
+    for packed_batch in data_loader.stream_batches(batch_size=batch_size, rng_key=rng_key):
+        yield convert_packed_sequences_to_batch(packed_batch)
 
 
 def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
@@ -72,7 +116,7 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     
     # Setup TPU mesh
     logger.info("Setting up TPU mesh...")
-    mesh = setup_tpu_mesh()
+    mesh = make_mesh()
     
     # Setup mixed precision policy
     logger.info("Setting up mixed precision policy...")
@@ -81,13 +125,22 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     
     # Setup data pipeline
     logger.info("Setting up data pipeline...")
-    fineweb_config = FineWebConfig(**config['data'])
-    tokenizer_config = TokenizerConfig(**config['data']['tokenizer'])
     
-    data_loader = create_data_loader(
-        config=fineweb_config,
-        tokenizer_config=tokenizer_config,
-    )
+    # Convert source dictionaries to DataSourceConfig objects
+    sources = []
+    for source_dict in config['data']['sources']:
+        source_config = DataSourceConfig(**source_dict)
+        sources.append(source_config)
+    
+    # Create data config with converted sources
+    data_config_dict = config['data'].copy()
+    data_config_dict['sources'] = sources
+    data_config = MultiSourceConfig(**data_config_dict)
+    
+    tokenizer_config = TokenizerConfig(**config['tokenizer'])
+    
+    # Create data loader with custom configuration
+    data_loader = MultiSourceDataLoader(data_config)
     
     # Setup checkpointing
     logger.info("Setting up checkpointing...")
@@ -100,7 +153,15 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     
     # Setup training loop
     logger.info("Setting up training loop...")
-    chunk_config = ChunkConfig(**config['training']['chunk_config'])
+    # Create ChunkConfig from training parameters
+    chunk_config = ChunkConfig(
+        chunk_size=config['training'].get('chunk_size', 8192),
+        overlap_size=config['training'].get('overlap_size', 512),
+        max_chunks_per_doc=config['training'].get('max_chunks_per_doc', 82),
+        backprop_chunks=config['training'].get('backprop_chunks', 4),
+        long_backprop_every=config['training'].get('long_backprop_every', 100),
+        long_backprop_chunks=config['training'].get('long_backprop_chunks', 16)
+    )
     curriculum_config = CurriculumConfig(phases=config['training']['curriculum']['phases'])
     
     training_loop = TrainingLoop(
@@ -253,7 +314,8 @@ def main():
         
         # Log training start
         total_steps = config['training']['total_steps']
-        dataset_info = components['data_loader'].get_stats()
+        # dataset_info = components['data_loader'].get_stats()  # Method doesn't exist, skip for now
+        dataset_info = {"sources": len(components['data_loader'].sources)}  # Simple fallback
         multi_logger.log_training_start(total_steps, dataset_info)
         
         # Main training loop
@@ -261,8 +323,14 @@ def main():
         start_time = time.time()
         
         try:
-            # Get data iterator
-            data_iterator = components['data_loader'].get_batch_iterator()
+            # Create data iterator with batch conversion
+            batch_size = config['training']['micro_batch_size']
+            rng_key = jax.random.PRNGKey(42)  # Default seed since not in config
+            data_iterator = create_batch_iterator(
+                components['data_loader'], 
+                batch_size=batch_size,
+                rng_key=rng_key
+            )
             
             # Train for specified steps
             final_state = components['training_loop'].train_epoch(
@@ -295,19 +363,74 @@ def main():
             return 0
             
         except Exception as e:
-            logger.error(f"Training failed: {e}")
+            import traceback
+            import sys
+            
+            # Get full traceback information
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            
+            logger.error("=" * 80)
+            logger.error("TRAINING FAILED - DETAILED ERROR INFORMATION")
+            logger.error("=" * 80)
+            logger.error(f"Exception Type: {exc_type.__name__}")
+            logger.error(f"Exception Message: {str(e)}")
+            logger.error("=" * 80)
+            logger.error("FULL TRACEBACK:")
+            logger.error("=" * 80)
+            
+            # Print full traceback with line numbers and context
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            for line in tb_lines:
+                logger.error(line.rstrip())
+            
+            logger.error("=" * 80)
+            logger.error("STACK TRACE WITH LOCAL VARIABLES:")
+            logger.error("=" * 80)
+            
+            # Print stack trace with local variables for debugging
+            tb = exc_traceback
+            while tb is not None:
+                frame = tb.tb_frame
+                filename = frame.f_code.co_filename
+                line_no = tb.tb_lineno
+                func_name = frame.f_code.co_name
+                
+                logger.error(f"File: {filename}")
+                logger.error(f"Function: {func_name}")
+                logger.error(f"Line: {line_no}")
+                
+                # Print local variables (be careful with large objects)
+                logger.error("Local variables:")
+                for var_name, var_value in frame.f_locals.items():
+                    try:
+                        # Limit string representation to avoid huge outputs
+                        var_str = str(var_value)
+                        if len(var_str) > 200:
+                            var_str = var_str[:200] + "... (truncated)"
+                        logger.error(f"  {var_name}: {var_str}")
+                    except Exception as var_error:
+                        logger.error(f"  {var_name}: <Error getting value: {var_error}>")
+                
+                logger.error("-" * 40)
+                tb = tb.tb_next
+            
+            logger.error("=" * 80)
             
             # Save emergency checkpoint
             try:
                 logger.info("Saving emergency checkpoint...")
                 components['checkpoint_manager'].save(training_state, checkpoint_type="emergency")
-            except:
-                logger.error("Failed to save emergency checkpoint")
+                logger.info("Emergency checkpoint saved successfully")
+            except Exception as checkpoint_error:
+                logger.error(f"Failed to save emergency checkpoint: {checkpoint_error}")
+                logger.error(f"Checkpoint error traceback: {traceback.format_exc()}")
             
             return 1
     
     except Exception as e:
+        import traceback
         logger.error(f"Setup failed: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         return 1
     
     finally:
