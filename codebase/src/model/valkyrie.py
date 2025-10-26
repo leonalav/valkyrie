@@ -185,22 +185,26 @@ class ValkyrieModel(nn.Module):
             layer_s5_state = past_s5_states[i]  # Use the state for this layer
             
             # Apply gradient checkpointing if needed (during training)
-            if training and hasattr(self.config, 'gradient_checkpointing') and self.config.gradient_checkpointing:
-                # Create a checkpointed version of the block's __call__ method
-                def checkpointed_block_call(x, freqs_cos, freqs_sin, position_ids, attention_mask, past_key_value, s5_state, global_tokens, training):
-                    return block(x, freqs_cos, freqs_sin, position_ids, attention_mask, past_key_value, s5_state, global_tokens, training)
-                
-                checkpointed_call = nn.remat(checkpointed_block_call)
+            if training and getattr(self.config, "gradient_checkpointing", False):
+                # IMPORTANT: arrays-only function + static training flag
+                # IMPORTANT: Make training a closure variable to avoid tracer issues
+                def _block_call(
+                    x, freqs_cos, freqs_sin, position_ids,
+                    attention_mask, past_key_value, s5_state, global_tokens
+                ):
+                    # No attribute poking; call the submodule purely
+                    # training is captured from closure, not passed as parameter
+                    return block(
+                        x, freqs_cos, freqs_sin, position_ids,
+                        attention_mask, past_key_value, s5_state,
+                        global_tokens, training
+                    )
+
+                # Create checkpointed version - training is captured from closure
+                checkpointed_call = nn.remat(_block_call)
                 x, present_key_value, next_s5_state = checkpointed_call(
-                    x, 
-                    freqs_cos=self.cos_freqs,
-                    freqs_sin=self.sin_freqs,
-                    position_ids=position_ids,
-                    attention_mask=attention_mask, 
-                    past_key_value=layer_past_key_value,
-                    s5_state=layer_s5_state,
-                    global_tokens=global_tokens,  # Pass HRM plan tokens
-                    training=training
+                    x, self.cos_freqs, self.sin_freqs, position_ids,
+                    attention_mask, layer_past_key_value, layer_s5_state, global_tokens
                 )
             else:
                 x, present_key_value, next_s5_state = block(x, 

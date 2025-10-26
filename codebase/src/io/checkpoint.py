@@ -177,7 +177,7 @@ class CheckpointManager:
         """
         
         if step is None:
-            step = state.get('step', 0)
+            step = getattr(state, 'step', 0)
         
         checkpoint_path = self._get_checkpoint_path(step, checkpoint_type)
         
@@ -286,7 +286,7 @@ class CheckpointManager:
     
     def _prepare_checkpoint_data(
         self,
-        state: Dict[str, Any],
+        state: Any,  # Changed from Dict[str, Any] to Any to support NamedTuple
         checkpoint_type: str,
     ) -> Dict[str, Any]:
         """Prepare data for checkpointing."""
@@ -294,43 +294,43 @@ class CheckpointManager:
         checkpoint_data = {}
         
         # Always save parameters
-        if 'params' in state:
-            checkpoint_data['params'] = state['params']
+        if hasattr(state, 'params'):
+            checkpoint_data['params'] = state.params
         
         # Always save step and basic info
-        checkpoint_data['step'] = state.get('step', 0)
-        checkpoint_data['rng'] = state.get('rng', jax.random.PRNGKey(0))
+        checkpoint_data['step'] = getattr(state, 'step', 0)
+        checkpoint_data['rng'] = getattr(state, 'rng', jax.random.PRNGKey(0))
         
         if checkpoint_type == "full":
             # Full checkpoint includes optimizer state and S5 states
-            if 'opt_state' in state:
-                checkpoint_data['opt_state'] = state['opt_state']
+            if hasattr(state, 'opt_state'):
+                checkpoint_data['opt_state'] = state.opt_state
             
-            if 's5_states' in state and state['s5_states'] is not None:
-                checkpoint_data['s5_states'] = state['s5_states']
+            if hasattr(state, 's5_states') and state.s5_states is not None:
+                checkpoint_data['s5_states'] = state.s5_states
             
             # HRM states (z_H, z_L) as specified in PLAN
-            if 'hrm_states' in state and state['hrm_states'] is not None:
-                checkpoint_data['hrm_states'] = state['hrm_states']
+            if hasattr(state, 'hrm_states') and state.hrm_states is not None:
+                checkpoint_data['hrm_states'] = state.hrm_states
             
             # Individual HRM state components for backward compatibility
-            if 'z_H' in state and state['z_H'] is not None:
-                checkpoint_data['z_H'] = state['z_H']
+            if hasattr(state, 'z_H') and state.z_H is not None:
+                checkpoint_data['z_H'] = state.z_H
             
-            if 'z_L' in state and state['z_L'] is not None:
-                checkpoint_data['z_L'] = state['z_L']
+            if hasattr(state, 'z_L') and state.z_L is not None:
+                checkpoint_data['z_L'] = state.z_L
             
             # HRM training metadata (segment info, cycle counts, etc.)
-            if 'hrm_metadata' in state:
-                checkpoint_data['hrm_metadata'] = state['hrm_metadata']
+            if hasattr(state, 'hrm_metadata'):
+                checkpoint_data['hrm_metadata'] = state.hrm_metadata
             
             # Add metadata
             checkpoint_data['metadata'] = {
                 'checkpoint_type': checkpoint_type,
                 'process_count': self.process_count,
                 'timestamp': time.time(),
-                'has_hrm_states': 'hrm_states' in state or ('z_H' in state and 'z_L' in state),
-                'has_s5_states': 's5_states' in state,
+                'has_hrm_states': hasattr(state, 'hrm_states') or (hasattr(state, 'z_H') and hasattr(state, 'z_L')),
+                'has_s5_states': hasattr(state, 's5_states'),
             }
         
         return checkpoint_data
@@ -339,39 +339,41 @@ class CheckpointManager:
         self,
         checkpoint_data: Dict[str, Any],
         checkpoint_type: str,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Restore training state from checkpoint data."""
         
-        state = {}
+        # Import TrainingState here to avoid circular imports
+        from ..train.train_loop import TrainingState
         
-        # Restore basic components
-        state['params'] = checkpoint_data['params']
-        state['step'] = checkpoint_data['step']
-        state['rng'] = checkpoint_data['rng']
+        # Restore basic components (required fields)
+        params = checkpoint_data['params']
+        step = checkpoint_data['step']
+        rng = checkpoint_data['rng']
+        opt_state = checkpoint_data.get('opt_state', None)
         
-        # Restore full state components if available
-        if 'opt_state' in checkpoint_data:
-            state['opt_state'] = checkpoint_data['opt_state']
+        # Restore optional components with defaults
+        s5_states = checkpoint_data.get('s5_states', None)
+        chunk_position = checkpoint_data.get('chunk_position', 0)
+        phase_index = checkpoint_data.get('phase_index', 0)
+        hrm_enabled = checkpoint_data.get('hrm_enabled', False)
+        hrm_training_state = checkpoint_data.get('hrm_training_state', None)
         
-        if 's5_states' in checkpoint_data:
-            state['s5_states'] = checkpoint_data['s5_states']
-        
-        # Restore HRM states as specified in PLAN
+        # Handle backward compatibility for HRM states
         if 'hrm_states' in checkpoint_data:
-            state['hrm_states'] = checkpoint_data['hrm_states']
+            hrm_training_state = checkpoint_data['hrm_states']
         
-        # Restore individual HRM state components for backward compatibility
-        if 'z_H' in checkpoint_data:
-            state['z_H'] = checkpoint_data['z_H']
-        
-        if 'z_L' in checkpoint_data:
-            state['z_L'] = checkpoint_data['z_L']
-        
-        # Restore HRM training metadata
-        if 'hrm_metadata' in checkpoint_data:
-            state['hrm_metadata'] = checkpoint_data['hrm_metadata']
-        
-        return state
+        # Construct and return the proper TrainingState NamedTuple
+        return TrainingState(
+            params=params,
+            opt_state=opt_state,
+            step=step,
+            rng=rng,
+            s5_states=s5_states,
+            chunk_position=chunk_position,
+            phase_index=phase_index,
+            hrm_enabled=hrm_enabled,
+            hrm_training_state=hrm_training_state
+        )
     
     def _get_latest_checkpoint_path(self, checkpoint_type: str = "full") -> Optional[Path]:
         """Get path to latest checkpoint of given type."""

@@ -1,0 +1,47 @@
+{
+  "checkpoints": [
+    {
+      "step": 0,
+      "path": "checkpoints/emergency_checkpoint_00000000",
+      "type": "emergency",
+      "timestamp": 1761494095.0525203,
+      "process_count": 1
+    },
+    {
+      "step": 0,
+      "path": "checkpoints/emergency_checkpoint_00000000",
+      "type": "emergency",
+      "timestamp": 1761494513.3629549,
+      "process_count": 1
+    },
+    {
+      "step": 0,
+      "path": "checkpoints/emergency_checkpoint_00000000",
+      "type": "emergency",
+      "timestamp": 1761495068.6521397,
+      "process_count": 1
+    },
+    {
+      "step": 0,
+      "path": "checkpoints/emergency_checkpoint_00000000",
+      "type": "emergency",
+      "timestamp": 1761496020.8914971,
+      "process_count": 1
+    }
+  ],
+  "config": {
+    "checkpoint_dir": "checkpoints",
+    "save_interval_steps": 1000,
+    "keep_checkpoints": 5,
+    "async_save": true,
+    "fast_checkpoint_interval": 100,
+    "full_checkpoint_interval": 1000,
+    "validate_on_save": true,
+    "validate_on_load": true,
+    "use_compression": true,
+    "compression_level": 6,
+    "save_optimizer_state": true,
+    "async_checkpointing": true
+  },
+  "last_updated": 1761496020.8915617
+}
