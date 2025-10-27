@@ -46,7 +46,7 @@ def create_train_step(
     """
     
     # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=True)
+    model_specs = get_model_specs(config, use_2d_sharding=False)
     training_specs = get_training_specs(model_specs)
     
     def train_step_fn(
@@ -195,7 +195,7 @@ def create_eval_step(
     """
     
     # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=True)
+    model_specs = get_model_specs(config, use_2d_sharding=False)
     
     def eval_step_fn(
         params: Dict[str, Any],

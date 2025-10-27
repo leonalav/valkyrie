@@ -72,8 +72,8 @@ class CheckpointManager:
         self.mesh = mesh
         self.partition_specs = partition_specs
         
-        # Setup checkpoint directory
-        self.checkpoint_dir = Path(config.checkpoint_dir)
+        # Setup checkpoint directory - use absolute path
+        self.checkpoint_dir = Path(config.checkpoint_dir).resolve()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Multi-host coordination
@@ -303,34 +303,67 @@ class CheckpointManager:
         
         if checkpoint_type == "full":
             # Full checkpoint includes optimizer state and S5 states
-            if hasattr(state, 'opt_state'):
+            # Replace hasattr with try/except to avoid tracer issues
+            try:
                 checkpoint_data['opt_state'] = state.opt_state
+            except AttributeError:
+                pass
             
-            if hasattr(state, 's5_states') and state.s5_states is not None:
-                checkpoint_data['s5_states'] = state.s5_states
+            try:
+                if state.s5_states is not None:
+                    checkpoint_data['s5_states'] = state.s5_states
+            except AttributeError:
+                pass
             
             # HRM states (z_H, z_L) as specified in PLAN
-            if hasattr(state, 'hrm_states') and state.hrm_states is not None:
-                checkpoint_data['hrm_states'] = state.hrm_states
+            try:
+                if state.hrm_states is not None:
+                    checkpoint_data['hrm_states'] = state.hrm_states
+            except AttributeError:
+                pass
             
             # Individual HRM state components for backward compatibility
-            if hasattr(state, 'z_H') and state.z_H is not None:
-                checkpoint_data['z_H'] = state.z_H
+            try:
+                if state.z_H is not None:
+                    checkpoint_data['z_H'] = state.z_H
+            except AttributeError:
+                pass
             
-            if hasattr(state, 'z_L') and state.z_L is not None:
-                checkpoint_data['z_L'] = state.z_L
+            try:
+                if state.z_L is not None:
+                    checkpoint_data['z_L'] = state.z_L
+            except AttributeError:
+                pass
             
             # HRM training metadata (segment info, cycle counts, etc.)
-            if hasattr(state, 'hrm_metadata'):
+            try:
                 checkpoint_data['hrm_metadata'] = state.hrm_metadata
+            except AttributeError:
+                pass
             
-            # Add metadata
+            # Add metadata - use try/except for state attribute checks
+            has_hrm_states = False
+            has_s5_states = False
+            
+            try:
+                has_hrm_states = state.hrm_states is not None
+            except AttributeError:
+                try:
+                    has_hrm_states = state.z_H is not None and state.z_L is not None
+                except AttributeError:
+                    pass
+            
+            try:
+                has_s5_states = state.s5_states is not None
+            except AttributeError:
+                pass
+            
             checkpoint_data['metadata'] = {
                 'checkpoint_type': checkpoint_type,
                 'process_count': self.process_count,
                 'timestamp': time.time(),
-                'has_hrm_states': hasattr(state, 'hrm_states') or (hasattr(state, 'z_H') and hasattr(state, 'z_L')),
-                'has_s5_states': hasattr(state, 's5_states'),
+                'has_hrm_states': has_hrm_states,
+                'has_s5_states': has_s5_states,
             }
         
         return checkpoint_data

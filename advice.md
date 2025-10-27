@@ -1,329 +1,331 @@
-Of course. This is a classic JAX ConcretizationTypeError. Let's break down what's happening and how to fix it.
-The Root Cause of the Error
-The error message Shapes must be 1D sequences of concrete values of integer type, got (2, 8, JitTracer<int32[]>, 64) is telling you that you are trying to create a JAX array (e.g., with jnp.zeros) where one of the dimensions of its shape is a JitTracer.
-A JitTracer is a symbolic placeholder that JAX uses during Just-In-Time (JIT) compilation. It represents a value that will only be known when the function is actually executed, not when it's being compiled. Because JAX needs to know the exact, concrete shape of all arrays at compile time to create an optimized computation graph (XLA), using a tracer as a shape dimension is forbidden.
-In your bigbird_block_sparse_attention function, this happens inside the main for loop when you calculate the size for the random attention keys and values.
-Problematic Code Block:
-code
-Python
-# ... inside the loop for middle blocks ...
+Got it — here’s a complete, soup-to-nuts fix plan for the training run that crashed, plus a few structural hardening steps so the entire training state is robust going forward. I’ve split this into (A) the immediate blocker (your AttributeError), (B) the emergency-checkpoint failure, and (C) correctness/perf hardening so you can actually train at your target context length and model size.
 
-# Determine maximum random sequence length across all heads using JAX operations
-valid_rand_mask = jnp.logical_and(rand_indices >= 0, rand_indices < to_blocks)
-valid_counts = jnp.sum(valid_rand_mask, axis=1)  # valid_counts is a Tracer
-max_valid_count = jnp.max(valid_counts)          # max_valid_count is a Tracer
-max_rand_seq_len = max_valid_count * to_block_size # max_rand_seq_len is a Tracer
+A) Immediate blocker — DynamicJaxprTracer has no attribute _state
+What’s happening (plain English)
 
-# ERROR HERE: Using a Tracer to define an array shape
-rand_key = jnp.zeros((batch_size, num_attention_heads, max_rand_seq_len, size_per_head))
-rand_value = jnp.zeros((batch_size, num_attention_heads, max_rand_seq_len, size_per_head))
-The value of max_rand_seq_len depends on the content of the rand_attn tensor, making it a dynamic value that JAX cannot resolve at compile time.
-The Solution: Use Static Shapes
-To fix this, you must create arrays with shapes that are known at compile time. The standard approach is to use the maximum possible shape and then use masking to handle the parts of the tensor that aren't needed for a given input.
-Fortunately, the correct code to do this already exists right after the buggy section. The fix is to simply remove the dynamic shape calculation.
-Here is the corrected bigbird_block_sparse_attention function. I've removed the erroneous lines and kept the correct, static implementation.
-code
-Python
-def bigbird_block_sparse_attention(
-    query_layer: jnp.ndarray,
-    key_layer: jnp.ndarray,
-    value_layer: jnp.ndarray,
-    band_mask: Optional[jnp.ndarray],
-    from_mask: Optional[jnp.ndarray],
-    to_mask: Optional[jnp.ndarray],
-    from_blocked_mask: Optional[jnp.ndarray],
-    to_blocked_mask: Optional[jnp.ndarray],
-    rand_attn: jnp.ndarray,
-    num_attention_heads: int,
-    size_per_head: int,
-    num_rand_blocks: int,
-    from_seq_length: int,
-    to_seq_length: int,
-    from_block_size: int,
-    to_block_size: int
-) -> jnp.ndarray:
-    """BigBird attention sparse calculation using blocks in linear time.
-    
-    Exact JAX translation of the original TensorFlow implementation.
-    
-    Args:
-        query_layer: [batch_size, num_attention_heads, from_seq_length, size_per_head]
-        key_layer: [batch_size, num_attention_heads, to_seq_length, size_per_head]
-        value_layer: [batch_size, num_attention_heads, to_seq_length, size_per_head]
-        band_mask: [batch_size, 1, from_seq_length, to_seq_length]
-        from_mask: [batch_size, 1, from_seq_length, 1]
-        to_mask: [batch_size, 1, 1, to_seq_length]
-        from_blocked_mask: [batch_size, from_seq_length//from_block_size, from_block_size]
-        to_blocked_mask: [batch_size, to_seq_length//to_block_size, to_block_size]
-        rand_attn: [num_attention_heads, from_seq_length//from_block_size-2, num_rand_blocks]
-        num_attention_heads: Number of attention heads
-        size_per_head: Size per attention head
-        num_rand_blocks: Number of random blocks
-        from_seq_length: Query sequence length
-        to_seq_length: Key sequence length
-        from_block_size: Query block size
-        to_block_size: Key block size
-        
-    Returns:
-        Context layer [batch_size, from_seq_length, num_attention_heads, size_per_head]
-    """
-    batch_size = query_layer.shape[0]
-    from_blocks = from_seq_length // from_block_size
-    to_blocks = to_seq_length // to_block_size
-    
-    # Reshape to blocks
-    blocked_query_matrix = query_layer.reshape(
-        batch_size, num_attention_heads, from_blocks, from_block_size, size_per_head
-    )
-    blocked_key_matrix = key_layer.reshape(
-        batch_size, num_attention_heads, to_blocks, to_block_size, size_per_head
-    )
-    blocked_value_matrix = value_layer.reshape(
-        batch_size, num_attention_heads, to_blocks, to_block_size, size_per_head
-    )
-    
-    # Initialize context layer
-    context_layer = jnp.zeros_like(blocked_query_matrix)
-    
-    # First block - full attention to first two blocks
-    if from_blocks > 0:
-        first_query = blocked_query_matrix[:, :, 0]  # [batch, heads, from_block_size, size_per_head]
-        first_key = jnp.concatenate([
-            blocked_key_matrix[:, :, 0],
-            blocked_key_matrix[:, :, 1]
-        ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
-        first_value = jnp.concatenate([
-            blocked_value_matrix[:, :, 0],
-            blocked_value_matrix[:, :, 1]
-        ], axis=2)  # [batch, heads, 2*to_block_size, size_per_head]
-        
-        # Compute attention scores
-        first_scores = jnp.einsum('bhqd,bhkd->bhqk', first_query, first_key)
-        first_scores = first_scores / math.sqrt(size_per_head)
-        
-        # Apply masks
-        if from_mask is not None and to_mask is not None:
-            first_from_mask = from_mask[:, :, :from_block_size, :]
-            first_to_mask = to_mask[:, :, :, :2*to_block_size]
-            mask = first_from_mask * first_to_mask
-            first_scores = jnp.where(mask == 0, -1e9, first_scores)
-        
-        # Apply softmax and compute context
-        first_probs = jax.nn.softmax(first_scores, axis=-1)
-        first_context = jnp.einsum('bhqk,bhkd->bhqd', first_probs, first_value)
-        context_layer = context_layer.at[:, :, 0].set(first_context)
-    
-    # Second block - special concatenation
-    if from_blocks > 1:
-        second_query = blocked_query_matrix[:, :, 1]
-        
-        # Determine how many blocks to concatenate based on available blocks
-        max_block_idx = min(2, to_blocks - 1)  # Don't go beyond available blocks
-        
-        if to_blocks >= 3:
-            # We have at least 3 blocks, concatenate blocks 0, 1, 2
-            second_key = jnp.concatenate([
-                blocked_key_matrix[:, :, 0],
-                blocked_key_matrix[:, :, 1],
-                blocked_key_matrix[:, :, 2]
-            ], axis=2)
-            second_value = jnp.concatenate([
-                blocked_value_matrix[:, :, 0],
-                blocked_value_matrix[:, :, 1],
-                blocked_value_matrix[:, :, 2]
-            ], axis=2)
-            key_blocks_used = 3
-        else:
-            # We only have 2 blocks, concatenate blocks 0, 1
-            second_key = jnp.concatenate([
-                blocked_key_matrix[:, :, 0],
-                blocked_key_matrix[:, :, 1]
-            ], axis=2)
-            second_value = jnp.concatenate([
-                blocked_value_matrix[:, :, 0],
-                blocked_value_matrix[:, :, 1]
-            ], axis=2)
-            key_blocks_used = 2
-        
-        second_scores = jnp.einsum('bhqd,bhkd->bhqk', second_query, second_key)
-        second_scores = second_scores / math.sqrt(size_per_head)
-        
-        if from_mask is not None and to_mask is not None:
-            second_from_mask = from_mask[:, :, from_block_size:2*from_block_size, :]
-            # Adjust to_mask size based on actual key blocks used
-            second_to_mask = to_mask[:, :, :, :key_blocks_used*to_block_size]
-            mask = second_from_mask * second_to_mask
-            second_scores = jnp.where(mask == 0, -1e9, second_scores)
-        
-        second_probs = jax.nn.softmax(second_scores, axis=-1)
-        second_context = jnp.einsum('bhqk,bhkd->bhqd', second_probs, second_value)
-        context_layer = context_layer.at[:, :, 1].set(second_context)
-    
-    # Middle blocks - window + global + random attention
-    for i in range(2, from_blocks - 2):
-        query_block = blocked_query_matrix[:, :, i]
-        
-        # Window attention (3 blocks: i-1, i, i+1)
-        window_key = jnp.concatenate([
-            blocked_key_matrix[:, :, i-1],
-            blocked_key_matrix[:, :, i],
-            blocked_key_matrix[:, :, i+1]
-        ], axis=2)
-        window_value = jnp.concatenate([
-            blocked_value_matrix[:, :, i-1],
-            blocked_value_matrix[:, :, i],
-            blocked_value_matrix[:, :, i+1]
-        ], axis=2)
-        
-        # Global attention (first and last blocks)
-        global_key = jnp.concatenate([
-            blocked_key_matrix[:, :, 0],
-            blocked_key_matrix[:, :, -1]
-        ], axis=2)
-        global_value = jnp.concatenate([
-            blocked_value_matrix[:, :, 0],
-            blocked_value_matrix[:, :, -1]
-        ], axis=2)
-        
-        # Random attention
-        rand_indices = rand_attn[:, i-2, :num_rand_blocks]  # [heads, num_rand_blocks]
-        
-        # =========================================================================
-        # FIX: The following block has been removed. It caused the ConcretizationTypeError
-        # by trying to create arrays with a data-dependent (dynamic) shape.
-        # 
-        #   valid_rand_mask = jnp.logical_and(rand_indices >= 0, rand_indices < to_blocks)
-        #   valid_counts = jnp.sum(valid_rand_mask, axis=1)
-        #   max_valid_count = jnp.max(valid_counts)
-        #   max_rand_seq_len = max_valid_count * to_block_size
-        #   rand_key = jnp.zeros((batch_size, num_attention_heads, max_rand_seq_len, size_per_head))
-        #   rand_value = jnp.zeros((batch_size, num_attention_heads, max_rand_seq_len, size_per_head))
-        # =========================================================================
-        
-        # Static approach: use maximum possible random sequence length. This is JIT-compatible.
-        static_max_rand_seq_len = num_rand_blocks * to_block_size
-        
-        # Initialize output tensors with static shapes
-        rand_key = jnp.zeros((batch_size, num_attention_heads, static_max_rand_seq_len, size_per_head))
-        rand_value = jnp.zeros((batch_size, num_attention_heads, static_max_rand_seq_len, size_per_head))
-        
-        # Vectorized processing for all heads using JAX operations
-        expanded_rand_indices = rand_indices  # Already [num_heads, num_rand_blocks]
-        
-        # Create valid mask for all operations: [num_heads, num_rand_blocks]
-        valid_mask = jnp.logical_and(
-            expanded_rand_indices >= 0, 
-            expanded_rand_indices < to_blocks
-        )
-        
-        # Use static indexing with proper bounds checking
-        # Clamp indices to valid range to avoid out-of-bounds access
-        safe_indices = jnp.clip(expanded_rand_indices, 0, to_blocks - 1)
-        
-        # Gather keys and values using static operations
-        # Shape: [batch, num_heads, num_rand_blocks, to_block_size, size_per_head]
-        gathered_keys = blocked_key_matrix[:, :, safe_indices]  # Advanced indexing
-        gathered_values = blocked_value_matrix[:, :, safe_indices]
-        
-        # Apply valid mask at block level first
-        # Expand mask to match block dimensions: [1, num_heads, num_rand_blocks, 1, 1]
-        block_mask = valid_mask[None, :, :, None, None]
-        
-        # Apply mask to gathered tensors
-        masked_gathered_keys = gathered_keys * block_mask
-        masked_gathered_values = gathered_values * block_mask
-        
-        # Reshape to combine random blocks into sequence dimension
-        # [batch, num_heads, num_rand_blocks * to_block_size, size_per_head]
-        reshaped_keys = masked_gathered_keys.reshape(batch_size, num_attention_heads, -1, size_per_head)
-        reshaped_values = masked_gathered_values.reshape(batch_size, num_attention_heads, -1, size_per_head)
-        
-        # The reshaped tensors already have the static max length, so we can use them directly
-        rand_key = reshaped_keys
-        rand_value = reshaped_values
-        
-        # Combine all attention patterns
-        combined_key = jnp.concatenate([window_key, global_key, rand_key], axis=2)
-        combined_value = jnp.concatenate([window_value, global_value, rand_value], axis=2)
-        
-        # Compute attention
-        scores = jnp.einsum('bhqd,bhkd->bhqk', query_block, combined_key)
-        scores = scores / math.sqrt(size_per_head)
-        
-        # Apply band mask if available
-        if band_mask is not None:
-            band_scores = scores[:, :, :, :3*to_block_size]  # Window part
-            
-            from_start = i * from_block_size
-            from_end = (i + 1) * from_block_size
-            to_start = (i - 1) * to_block_size
-            to_end = (i + 2) * to_block_size
-            
-            block_band_mask = band_mask[:, :, from_start:from_end, to_start:to_end]
-            
-            band_scores = jnp.where(block_band_mask == 0, -1e9, band_scores)
-            scores = scores.at[:, :, :, :3*to_block_size].set(band_scores)
-        
-        probs = jax.nn.softmax(scores, axis=-1)
-        context = jnp.einsum('bhqk,bhkd->bhqd', probs, combined_value)
-        context_layer = context_layer.at[:, :, i].set(context)
-    
-    # Second-to-last block
-    if from_blocks > 3:
-        second_last_query = blocked_query_matrix[:, :, -2]
-        second_last_key = jnp.concatenate([
-            blocked_key_matrix[:, :, -3],
-            blocked_key_matrix[:, :, -2],
-            blocked_key_matrix[:, :, -1]
-        ], axis=2)
-        second_last_value = jnp.concatenate([
-            blocked_value_matrix[:, :, -3],
-            blocked_value_matrix[:, :, -2],
-            blocked_value_matrix[:, :, -1]
-        ], axis=2)
-        
-        second_last_scores = jnp.einsum('bhqd,bhkd->bhqk', second_last_query, second_last_key)
-        second_last_scores = second_last_scores / math.sqrt(size_per_head)
-        
-        if from_mask is not None and to_mask is not None:
-            sl_from_mask = from_mask[:, :, -2*from_block_size:-from_block_size, :]
-            sl_to_mask = to_mask[:, :, :, -3*to_block_size:]
-            mask = sl_from_mask * sl_to_mask
-            second_last_scores = jnp.where(mask == 0, -1e9, second_last_scores)
-        
-        second_last_probs = jax.nn.softmax(second_last_scores, axis=-1)
-        second_last_context = jnp.einsum('bhqk,bhkd->bhqd', second_last_probs, second_last_value)
-        context_layer = context_layer.at[:, :, -2].set(second_last_context)
-    
-    # Last block - full attention to last two blocks
-    if from_blocks > 1:
-        last_query = blocked_query_matrix[:, :, -1]
-        last_key = jnp.concatenate([
-            blocked_key_matrix[:, :, -2],
-            blocked_key_matrix[:, :, -1]
-        ], axis=2)
-        last_value = jnp.concatenate([
-            blocked_value_matrix[:, :, -2],
-            blocked_value_matrix[:, :, -1]
-        ], axis=2)
-        
-        last_scores = jnp.einsum('bhqd,bhkd->bhqk', last_query, last_key)
-        last_scores = last_scores / math.sqrt(size_per_head)
-        
-        if from_mask is not None and to_mask is not None:
-            last_from_mask = from_mask[:, :, -from_block_size:, :]
-            last_to_mask = to_mask[:, :, :, -2*to_block_size:]
-            mask = last_from_mask * last_to_mask
-            last_scores = jnp.where(mask == 0, -1e9, last_scores)
-        
-        last_probs = jax.nn.softmax(last_scores, axis=-1)
-        last_context = jnp.einsum('bhqk,bhkd->bhqd', last_probs, last_value)
-        context_layer = context_layer.at[:, :, -1].set(last_context)
-    
-    # Reshape back to sequence format
-    context_layer = context_layer.reshape(
-        batch_size, from_seq_length, num_attention_heads, size_per_head
-    )
-    
-    return context_layer
-This change directly resolves the error you are seeing and aligns the code with standard JAX practices for writing JIT-compatible functions.
+Inside ValkyrieModel.__call__ you’re doing an attribute probe like thing._state or hasattr(thing, "_state") on a traced JAX value (a DynamicJaxprTracer). During jit/grad, JAX forbids arbitrary attribute access on tracers; even hasattr(tracer, "_state") internally calls getattr and explodes — exactly the error you see.
+
+From the stack, this happens when you iterate layers and pass an S5 state into a checkpointed_call of a ValkyrieBlock. In locals we see:
+
+layer_s5_state: JitTracer<complex64[1,768]>
+
+In the same frame, error mentions ._state — so somewhere you assume the S5 state is a wrapper object with a ._state field, but at trace time it’s just an array tracer.
+
+Minimal, safe fix (avoid attribute access on tracers)
+
+Never use hasattr(x, "_state") (or getattr(x, "_state", ...)) inside any jitted region.
+
+Replace with an explicit type check against your wrapper type, not an attribute:
+
+# src/model/valkyrie.py (near __call__)
+from src.modules.s5 import S5State  # or wherever it lives
+
+def _as_s5_array(s):
+    # Safe: does not touch tracer attributes
+    return s.state if isinstance(s, S5State) else s
+
+
+Then, before calling the block:
+
+s5_in = _as_s5_array(layer_s5_state)
+x, present_key_value, next_s5_state = checkpointed_call(
+    block, x, s5_in, position_ids=..., attention_mask=..., training=training, ...
+)
+# Normalize on the way out too:
+next_s5_states.append(_as_s5_array(next_s5_state))
+
+
+Search & destroy every tracer-unsafe probe:
+
+grep -R "hasattr(.*_state" -n src
+grep -R "\._state" -n src
+grep -R "getattr(.*_state" -n src
+
+
+Refactor each site with isinstance(..., S5State) → use .state, else leave as array.
+
+Why this is correct
+isinstance(tracer, S5State) returns False for tracers (they’re not your dataclass), so you’ll never poke into tracer attributes. When you do have the wrapper (e.g., outside jit or when constructing), it resolves cleanly.
+
+Optional but recommended: make S5 state a crisp pytree
+
+If you truly want a wrapper, define it as a Flax/JAX pytree so you can pass it through jitted code without manual unwrapping, and don’t use leading underscore field names (they often signal “private” and invite attr probing):
+
+# src/modules/s5_state.py
+import flax
+import jax.numpy as jnp
+
+@flax.struct.dataclass
+class S5State:
+    state: jnp.ndarray  # [*, d_state], complex64
+
+
+Then always pass/return S5State consistently and remove any probing. Or, simplest: standardize on raw arrays for S5 state everywhere and delete the wrapper entirely.
+
+B) Secondary crash — Orbax emergency checkpoint path
+
+You got:
+
+ValueError: Checkpoint path should be absolute. Got checkpoints/emergency_checkpoint_00000000.orbax-checkpoint-tmp
+
+
+Orbax requires absolute paths, and your emergency writer is using a relative path. Fix in either config or code:
+
+Config-level fix (fastest)
+
+In your YAML (e.g., configs/valkyrie_tpu_v4_8.yaml) ensure:
+
+checkpoint:
+  base_dir: /home/ravkeave/v1/codebase/checkpoints  # absolute
+  save_every_steps: 1000
+  keep_last: 5
+  emergency_dirname: emergency  # we'll join on base_dir
+
+Code-level hardening (normalizes everywhere)
+
+In your checkpoint util (looks like src/io/checkpoint.py):
+
+import os
+
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.abspath(path)
+
+# Wherever you construct dirs
+base_dir = _abs(cfg.checkpoint.base_dir)
+emergency_dir = os.path.join(base_dir, cfg.checkpoint.emergency_dirname)
+os.makedirs(emergency_dir, exist_ok=True)
+
+Avoid double-fault on exceptions
+
+When you’re already crashing, don’t use async commit for the emergency save — finish synchronously:
+
+from orbax.checkpoint import Checkpointer  # not AsyncCheckpointer
+
+with Checkpointer(...) as ckpt:
+    ckpt.save(emergency_dir, save_args=..., options=...)
+
+
+Also, clean stale temp dirs:
+
+rm -rf /home/ravkeave/v1/codebase/checkpoints/*orbax-checkpoint-tmp
+
+C) Make the whole training state reliable (correctness & perf)
+
+These will keep you from hitting different walls after fixing A & B.
+
+1) Don’t cache KV during training with grad checkpointing
+
+You pass use_cache=True while gradient_checkpointing=True. That’s a classic “hold all activations AND re-materialize” footgun.
+
+In process_valid_chunk(...) (train loop) pass use_cache=False to the model during training.
+
+Or default use_cache = training and phase_config.use_cache and set use_cache: false in training phases.
+
+outputs = self.model.apply(
+    params,
+    chunk_input,
+    position_ids=...,
+    attention_mask=...,
+    s5_states=current_s5_states,
+    labels=chunk_labels,
+    training=True,
+    use_cache=False,  # <—— change this
+    rngs={"dropout": dropout_rng_chunk, "random": random_rng_chunk},
+)
+
+2) Guard optional features by phase
+
+Your phase shows hrm_enabled=False, but the model still constructs next_hrm_state every call. Put the HRM path under an explicit guard so you don’t materialize big tensors you won’t use:
+
+if self.config.hrm_enabled and training: 
+    # run HRM planner/executor
+else:
+    next_hrm_state = None
+
+
+Tie hrm_enabled to phase (runtime) not only to global model config.
+
+3) Memory pressure & chunking sanity
+
+Given: batch_size=8, full_seq_len=65536, chunk_size=4096, backprop_chunks=1, 36 layers, d=1536. That’s huge.
+
+Quick knobs that don’t change the optimizer step semantics:
+
+Increase backprop_chunks (e.g., 4 or 8) so each step backprops through fewer tokens at a time.
+
+If needed, reduce chunk_size (e.g., 2048) while you validate correctness.
+
+Keep gradient_checkpointing=True.
+
+Consider activation dtype to bfloat16 on TPU: make sure your mixed precision policy does compute in bfloat16 and params in float32.
+
+4) Make your logical mesh match devices
+
+Log shows Mesh(axis_sizes=(4, 1)) on v4-8. If you intend to use all 8 chips on a single host, you likely want (8, 1) or another partition that matches your sharding. Double-check device count:
+
+# During init
+devices = jax.devices()
+n = len(devices)  # should be 8 on v4-8 single host
+mesh = Mesh(np.array(devices).reshape((n, 1)), ('x', 'z'))
+
+
+If you deliberately use 4 chips for memory, fine — otherwise you’re leaving perf on the table.
+
+5) Eliminate Python-side dynamic structures inside jit
+
+Building Python lists/dicts inside a jitted loop is fragile. In __call__ you do:
+
+next_key_values = []
+next_s5_states = []
+for i, ...:
+    ...
+    next_key_values.append(kv)
+    next_s5_states.append(s5)
+return x, next_key_values, next_s5_states
+
+
+Make sure you return tuples, not lists, and you don’t mutate post-return. Even better, use jax.lax.scan over layers if you can (you’re already scanning over chunks; scanning over layers can help compiler too).
+
+At minimum:
+
+return x, tuple(next_key_values), tuple(next_s5_states)
+
+6) Position handling: keep it pure
+
+You have start_pos, end_pos as tracers and closures reset_position / keep_position. Ensure those functions don’t close over or mutate Python lists of states. They should return new pytrees, not mutate the incoming one. If you are slicing a list of S5 states, use jax.tree_util.tree_map over a tuple.
+
+7) Data/labels alignment (quick check)
+
+Your locals show:
+
+chunk_input: [8,4096]
+
+chunk_input_shifted: [8,4095]
+
+chunk_labels: [8,4096]
+
+Ensure your loss only evaluates on the 4095 predictive positions (or that labels are padded with -100 at index 0) so you don’t index out of bounds or inflate loss. (This hasn’t crashed you yet, but it’s a common source of silent bugs.)
+
+8) Mixed precision policy (TPU)
+
+Confirm your MixedPrecisionPolicy ends up with:
+
+compute dtype: bfloat16
+
+param dtype: float32
+
+output/logits dtype: float32
+
+If you’re still on float32 compute, memory & speed will both suffer.
+
+9) Logging & debug hygiene
+
+Set JAX_TRACEBACK_FILTERING=off while you iterate on crashes.
+
+Log use_cache, hrm_enabled, chunk_size, backprop_chunks per phase at INFO right before compiling the train step — saves a ton of time later.
+
+10) Emergency save behavior on exceptions
+
+Wrap the training epoch in a try/except and do a synchronous save with an absolute path, then re-raise:
+
+try:
+    final_state = training_loop.train_epoch(...)
+except Exception as e:
+    safe_path = os.path.join(abs_base_dir, "emergency", f"emergency_checkpoint_{global_step:08d}")
+    ckpt = Checkpointer(...)  # sync
+    ckpt.save(safe_path, save_args=..., options=...)
+    raise
+
+D) Concrete diffs you can drop in
+1) src/model/valkyrie.py (normalize S5 state & don’t probe tracers)
+@@
+-    checkpointed_call = _block_call  # grad ckpt toggled elsewhere
++    checkpointed_call = _block_call  # grad ckpt toggled elsewhere
+
++    from src.modules.s5_state import S5State  # adjust import path
++    def _as_s5_array(s):
++        # Avoid hasattr/getattr on tracers
++        return s.state if isinstance(s, S5State) else s
+@@
+-    for i, (block, layer_s5_state) in enumerate(zip(self.blocks, past_s5_states)):
+-        x, present_key_value, next_s5_state = checkpointed_call(
+-            block, x, layer_s5_state, position_ids=position_ids, attention_mask=attention_mask,
+-            training=training, use_cache=use_cache, rngs=rngs
+-        )
+-        next_key_values.append(present_key_value)
+-        next_s5_states.append(next_s5_state)
++    for i, (block, layer_s5_state) in enumerate(zip(self.blocks, past_s5_states)):
++        s5_in = _as_s5_array(layer_s5_state)
++        x, present_key_value, next_s5_state = checkpointed_call(
++            block, x, s5_in, position_ids=position_ids, attention_mask=attention_mask,
++            training=training, use_cache=use_cache, rngs=rngs
++        )
++        next_key_values.append(present_key_value)
++        next_s5_states.append(_as_s5_array(next_s5_state))
+@@
+-    return x, next_key_values, next_s5_states
++    return x, tuple(next_key_values), tuple(next_s5_states)
+
+
+(Also remove any remaining hasattr(x, "_state") and getattr(x, "_state", ...) everywhere in the repo.)
+
+2) src/train/train_loop.py (don’t cache during training)
+-outputs = self.model.apply(
++outputs = self.model.apply(
+     state.params,
+     chunk_input,
+     position_ids=position_ids_chunk,
+     attention_mask=attention_mask_chunk,
+     s5_states=current_s5_states,
+     labels=chunk_labels,
+-    training=True, use_cache=True,
++    training=True, use_cache=False,
+     rngs={"dropout": dropout_rng_chunk, "random": random_rng_chunk},
+)
+
+3) src/io/checkpoint.py (force absolute paths)
++def _abs(path: str) -> str:
++    import os
++    return path if os.path.isabs(path) else os.path.abspath(path)
+
+ def prepare_checkpoint_dirs(cfg):
+-    base = cfg.checkpoint.base_dir
++    base = _abs(cfg.checkpoint.base_dir)
+     os.makedirs(base, exist_ok=True)
+     if hasattr(cfg.checkpoint, "emergency_dirname"):
+-        emerg = os.path.join(base, cfg.checkpoint.emergency_dirname)
++        emerg = os.path.join(base, cfg.checkpoint.emergency_dirname)
+         os.makedirs(emerg, exist_ok=True)
+     return base
+
+
+And in your emergency writer, join on prepare_checkpoint_dirs(cfg) and use the sync Checkpointer inside the exception path.
+
+E) Sanity checklist to run after patching
+
+Clean stale checkpoints
+
+rm -rf /home/ravkeave/v1/codebase/checkpoints/*orbax-checkpoint-tmp
+
+
+Dry-run compile with a tiny shape
+
+Set chunk_size=1024, backprop_chunks=2, seq_len=8192, batch_size=1, steps=1.
+
+use_cache=False, hrm_enabled=False in phase 0.
+
+Goal: reach step 1, no attribute errors, no Orbax error on exit.
+
+Bump to your target chunking
+
+Gradually raise chunk_size→2048→4096, then increase backprop_chunks (4–8) instead of batch size.
+
+Confirm mesh
+
+Log available devices and your mesh axis sizes at startup. Ensure you’re using what you intend.
+
+Quick numeric check
+
+Over a fixed small batch, run two steps and ensure loss decreases or at least is finite and gradients aren’t NaN (log jnp.isnan counts).
+
+If you apply the tracer-safe state handling and stop caching during training, the crash you posted will disappear. The absolute-path change will prevent the emergency-save cascade from masking the real error with a second failure. The rest of the checklist keeps you from hitting new walls as you scale the run back up.

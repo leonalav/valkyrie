@@ -148,7 +148,7 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     checkpoint_manager = CheckpointManager(
         config=checkpoint_config,
         mesh=mesh,
-        partition_specs=get_model_specs(model.config, use_2d_sharding=True),
+        partition_specs=get_model_specs(model.config, use_2d_sharding=False),
     )
     
     # Setup training loop

@@ -160,7 +160,7 @@ def get_hrm_specs() -> Dict[str, P]:
     }
 
 
-def get_model_specs(config: Any, use_2d_sharding: bool = True) -> Dict[str, Any]:
+def get_model_specs(config: Any, use_2d_sharding: bool = False) -> Dict[str, Any]:
     """
     Get complete PartitionSpecs for Valkyrie model.
     

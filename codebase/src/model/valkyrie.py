@@ -11,12 +11,48 @@ DO NOT MODIFY - these implementations are mathematically verified for:
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax import struct
 import optax
 from typing import Optional, Union, Tuple, List
 from .modules import ValkyrieConfig, RMSNorm, precompute_rope_freqs, TiedEmbedding
 from .s5 import ValkyrieS5
 from .bigbird_attention import BigBirdAttention
 from .hrm_integration import ValkyrieHRM, HRMPlannerState
+try:
+    # If you already have a canonical S5State type, we'll interop with it too.
+    from src.modules.s5_state import S5State as _ExternalS5State  # adjust path if needed
+except Exception:  # pragma: no cover
+    _ExternalS5State = None
+
+# --- S5 state compatibility layer -------------------------------------------
+# A flax struct so JAX can carry it through jit/scan. Uses only .state field
+# to avoid JAX tracing issues with duplicate field access.
+@struct.dataclass
+class S5StateCompat:
+    state: jnp.ndarray
+
+def to_s5_wrapper(s):
+    """Normalize any incoming S5 state to a wrapper object (never a raw tracer).
+    Safe in jit because we don't touch tracer attributes; we only check Python types.
+    """
+    if s is None:
+        return None
+    if isinstance(s, S5StateCompat):
+        return s
+    if _ExternalS5State is not None and isinstance(s, _ExternalS5State):
+        return s  # already a proper wrapper
+    # Otherwise s is presumed to be an array/tracer; wrap it with state field only.
+    return S5StateCompat(state=s)
+
+def unwrap_s5(s):
+    """Return the underlying array for storage/serialization."""
+    if s is None:
+        return None
+    if isinstance(s, S5StateCompat):
+        return s.state
+    if _ExternalS5State is not None and isinstance(s, _ExternalS5State):
+        return s.state  # canonical external wrapper
+    return s  # already an array
 
 
 class ValkyrieFFN(nn.Module):
@@ -136,6 +172,7 @@ class ValkyrieModel(nn.Module):
         use_cache: bool = False,
         labels: Optional[jnp.ndarray] = None,
         training: bool = False,
+        hrm_enabled: bool = True,  # Runtime HRM enabling for phase-based control
         return_dict: bool = True
     ):
         batch_size, seq_len = input_ids.shape
@@ -162,10 +199,10 @@ class ValkyrieModel(nn.Module):
         
         x = self.embedding(input_ids)
         
-        # HRM Planning Phase
+        # HRM Planning Phase - guard by both config and runtime phase setting
         global_tokens = None
         next_hrm_state = hrm_state
-        if self.config.use_hrm and hasattr(self, 'hrm'):
+        if self.config.use_hrm and hrm_enabled and hasattr(self, 'hrm'):
             global_tokens, enhanced_x, next_hrm_state = self.hrm(
                 x,  # input_embeddings
                 x,  # sequence_states (same as input embeddings initially)
@@ -194,32 +231,37 @@ class ValkyrieModel(nn.Module):
                 ):
                     # No attribute poking; call the submodule purely
                     # training is captured from closure, not passed as parameter
+                    # Unwrap s5_state to get the raw array for the block call
+                    s5_raw = unwrap_s5(s5_state) if s5_state is not None else None
                     return block(
                         x, freqs_cos, freqs_sin, position_ids,
-                        attention_mask, past_key_value, s5_state,
+                        attention_mask, past_key_value, s5_raw,
                         global_tokens, training
                     )
 
                 # Create checkpointed version - training is captured from closure
-                checkpointed_call = nn.remat(_block_call)
+                # Use jax.checkpoint instead of nn.remat to avoid self parameter issues
+                checkpointed_call = jax.checkpoint(_block_call)
+                s5_in = to_s5_wrapper(layer_s5_state)
                 x, present_key_value, next_s5_state = checkpointed_call(
                     x, self.cos_freqs, self.sin_freqs, position_ids,
-                    attention_mask, layer_past_key_value, layer_s5_state, global_tokens
+                    attention_mask, layer_past_key_value, s5_in, global_tokens
                 )
             else:
+                s5_raw = unwrap_s5(to_s5_wrapper(layer_s5_state))
                 x, present_key_value, next_s5_state = block(x, 
                                            freqs_cos=self.cos_freqs,
                                            freqs_sin=self.sin_freqs,
                                            position_ids=position_ids,
                                            attention_mask=attention_mask, 
                                            past_key_value=layer_past_key_value,
-                                           s5_state=layer_s5_state,
+                                           s5_state=s5_raw,
                                            global_tokens=global_tokens,  # Pass HRM plan tokens
                                            training=training)
             
             # Collect next S5 states
             if self.config.use_s5:
-                next_s5_states.append(next_s5_state)
+                next_s5_states.append(unwrap_s5(next_s5_state))
             
             if use_cache:
                 next_key_values.append(present_key_value)
@@ -285,9 +327,10 @@ class ValkyrieModel(nn.Module):
         return {
             'logits': logits,
             'loss': loss,
+            'loss_components': loss_components,
             'past_key_values': tuple(next_key_values) if use_cache else None,
             's5_states': tuple(next_s5_states) if self.config.use_s5 else None,
-            'hrm_state': next_hrm_state if self.config.use_hrm else None
+            'hrm_state': next_hrm_state if (self.config.use_hrm and hrm_enabled) else None
         }
 
     def generate(self,

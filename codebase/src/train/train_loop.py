@@ -280,13 +280,24 @@ class TrainingLoop:
                         # Derive per-chunk RNG streams for dropout and random attention
                         dropout_rng_chunk = jax.random.fold_in(state.rng, chunk_idx)
                         random_rng_chunk = jax.random.fold_in(state.rng, chunk_idx + 1)
+                        
+                        # Expand S5 states to match batch size for model forward pass
+                        def expand_s5_state(s5_state):
+                            if s5_state.shape[0] != batch_size:
+                                # Tile the state to match the batch size
+                                return jnp.tile(s5_state, (batch_size,) + (1,) * (s5_state.ndim - 1))
+                            return s5_state
+                        
+                        expanded_s5_states = jax.tree_util.tree_map(expand_s5_state, current_s5_states)
+                        
                         outputs = self.model.apply(
                             {'params': params},
                             input_ids=chunk_input,
                             labels=chunk_labels,
-                            s5_states=current_s5_states,
-                            use_cache=True,
+                            s5_states=expanded_s5_states,
+                            use_cache=False,  # Disable cache during training to avoid memory footgun
                             training=True,
+                            hrm_enabled=phase_config.hrm_enabled,  # Pass phase-based HRM control
                             return_dict=True,
                             rngs={
                                 'dropout': dropout_rng_chunk,
@@ -297,6 +308,22 @@ class TrainingLoop:
                         chunk_loss = outputs['loss']
                         new_total_loss = total_loss + chunk_loss
                         new_s5_states = outputs['s5_states']
+                        
+                        # Reduce S5 states back to single batch dimension to maintain scan carry consistency
+                        # Take the first element from the batch dimension since all elements should have the same sequential state
+                        def reduce_s5_state(s5_state):
+                            if s5_state.shape[0] > 1:
+                                return s5_state[0:1]  # Keep first element with batch dimension 1
+                            return s5_state
+                        
+                        new_s5_states = jax.tree_util.tree_map(reduce_s5_state, new_s5_states)
+                        
+                        # Ensure s5_states has the same pytree structure as current_s5_states
+                        # Convert to the same type to avoid JAX pytree structure mismatch
+                        if isinstance(current_s5_states, list):
+                            new_s5_states = list(new_s5_states) if not isinstance(new_s5_states, list) else new_s5_states
+                        elif isinstance(current_s5_states, tuple):
+                            new_s5_states = tuple(new_s5_states) if not isinstance(new_s5_states, tuple) else new_s5_states
                         
                         # Add HRM loss if enabled in current phase
                         new_hrm_loss = hrm_loss
@@ -330,6 +357,7 @@ class TrainingLoop:
                         return (new_total_loss, new_s5_states, new_hrm_loss, new_hrm_metrics)
                     
                     def skip_chunk():
+                        # Return S5 states with consistent batch dimension (should already be [1, 768])
                         return (total_loss, current_s5_states, hrm_loss, hrm_metrics)
                     
                     return jax.lax.cond(
@@ -375,14 +403,13 @@ class TrainingLoop:
             new_params = optax.apply_updates(state.params, updates)
             
             # Update chunk position
-            phase = self.curriculum_config.phases[state.phase_index]
-            backprop_chunks = phase['backprop_chunks']
+            backprop_chunks = phase_config.backprop_chunks
             new_chunk_position = state.chunk_position + backprop_chunks
             
             # Check if we need to advance to next phase using JAX-compatible operations
             max_phase_index = len(self.curriculum_config.phases) - 1
             can_advance = jnp.logical_and(
-                state.step >= phase['max_steps'],
+                state.step >= phase_config.steps,
                 state.phase_index < max_phase_index
             )
             
@@ -420,6 +447,9 @@ class TrainingLoop:
                 hrm_enabled=new_hrm_enabled,
                 hrm_training_state=new_hrm_training_state,
             )
+            
+            # Initialize HRM metrics (empty if HRM not enabled)
+            hrm_metrics = {}
             
             metrics = {
                 'loss': loss,
