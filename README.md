@@ -111,3 +111,14 @@ Will implement in Phase 2, latter states.
 ## License
 
 MIT
+
+
+## Contacts
+
+For research inquiries or other matters, please reach out via email at  
+**duchuypm@gmail.com** or **ravkeave@gmail.com**.
+
+## P/S: regarding papers
+The researcher in charge (me!) is a high school student. Research credentials and papers for this model will temporarily not be available.
+
+
