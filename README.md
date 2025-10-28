@@ -17,7 +17,7 @@ Valkyrie is a language model designed for efficient, hierarchical reasoning. It 
 
 ## Why this design
 
-People chase parameter counts. We chase *structured memory and planning*. The S5 path gives per-layer carryable state that behaves like a long-term integrator; BigBird lets us scale attention sparsely; HRM lets the model explicitly plan with a small set of global tokens that every block can consult. The result is a model that reasons in stages rather than merely pattern-completing. Of course it's a WIP research.
+This project is built with a **strong emphasis on accuracy and reasoning efficiency for small-scale LLMs**, deviating from the trend of scaling toward massive parameter counts. The S5 path gives per-layer carryable state that behaves like a long-term integrator; BigBird lets us scale attention sparsely; HRM lets the model explicitly plan with a small set of global tokens that every block can consult. The result is a model that reasons in stages rather than merely pattern-completing. Of course it's a WIP research.
 
 ---
 
