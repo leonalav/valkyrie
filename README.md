@@ -12,7 +12,7 @@ Valkyrie is a language model designed for efficient, hierarchical reasoning. It 
 * **Fusion idea:** BigBird (sparse global/window/random attention) + S5 residual state-space modules for long-range, stable signal propagation + HRM planner that writes global plan tokens every forward.
 * **Shapes used in the repo:** `d_model = 1536`, `n_heads = 24`, `head_dim = 64`.
 * **Framework & infra:** developed for JAX / Flax with Optax optimizers; trained and prototyped on TPU v4 families (v4-8 → v4-32).
-
+* **Major adjustments** rewrote S5 to work for JAX without the need for CUDA, as well as converting HRM to a JAX-compatible base
 ---
 
 ## Why this design
