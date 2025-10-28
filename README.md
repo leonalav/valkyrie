@@ -48,30 +48,31 @@ Below are four diagrams (plus shape notes) showing the full story:
 
 ```mermaid
 flowchart TD
-  A[input_ids  (B, S)] --> B[TiedEmbedding  → x (B, S, D)]
-  subgraph HRM (optional, if config.use_hrm)
-    B --> C[HRM planner (ValkyrieHRM)]
-    C -->|plan_tokens (B, G, D)| Cg
-    C -->|enhanced_x (B, S, D)| B2
+  A["input_ids (B, S)"] --> B["TiedEmbedding → x (B, S, D)"]
+  subgraph HRM ["optional, if config.use_hrm"]
+    B --> C["HRM planner (ValkyrieHRM)"]
+    C -->|"plan_tokens (B, G, D)"| Cg["plan_tokens"]
+    C -->|"enhanced_x (B, S, D)"| B2["enhanced_x"]
   end
-  B2:::maybeHRM --> D[Precomputed RoPE freqs (cos/sin)]
-  D -->|cos/sin| E[Layer loop i=0..n_layers-1]
+  B2:::maybeHRM --> D["Precomputed RoPE freqs (cos/sin)"]
+  D -->|"cos/sin"| E["Layer loop i=0..n_layers-1"]
 
-  subgraph Block i
-    E --> F1[RMSNorm]
-    F1 --> F2[BigBirdAttention<br/>window + random + global(plan_tokens)]
+  subgraph "Block i"
+    E --> F1["RMSNorm"]
+    F1 --> F2["BigBirdAttention: window + random + global(plan_tokens)"]
     Cg:::maybeHRM --> F2
-    F2 --> F3[Residual add]
-    F3 --> G1[RMSNorm]
-    G1 --> G2[ValkyrieS5 (state-space)  → s5_out]
-    G2 --> G3[Residual add]
-    G3 --> H[next_kv_i?, next_s5_state_i?]
+    F2 --> F3["Residual add"]
+    F3 --> G1["RMSNorm"]
+    G1 --> G2["ValkyrieS5 (state-space) → s5_out"]
+    G2 --> G3["Residual add"]
+    G3 --> H["next_kv_i?, next_s5_state_i?"]
   end
 
-  E --> I[Final RMSNorm]
-  I --> J[TiedEmbedding.attend (tied lm head) → logits (B, S, V)]
-  J --> K[Shift & CE loss (+ S5 reg during training)]
-  H -. collect .-> L[lists: next_key_values, next_s5_states]
+  E --> I["Final RMSNorm"]
+  I --> J["TiedEmbedding.attend (tied lm head) → logits (B, S, V)"]
+  J --> K["Shift & CE loss (+ S5 reg during training)"]
+  H -.-> L["lists: next_key_values, next_s5_states"]
+
   classDef maybeHRM fill:#eef,stroke:#99f,color:#003;
 ```
 
