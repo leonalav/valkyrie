@@ -4,7 +4,7 @@
 # Include base model configuration
 model:
   # Model architecture - Valkyrie with BigBird + S5 + HRM (Blueprint Config B: 1.2B params)
-  vocab_size: 32000   # 32k SentencePiece/BPE tokenizer
+  vocab_size: 50257   # GPT-2 tokenizer vocab size (was 32000 - caused OOB token errors)
   d_model: 1536       # Model dimension (Config B)
   n_layers: 36        # Number of transformer layers (Config B for 1.2B params)
   n_heads: 24         # Number of attention heads (Config B)

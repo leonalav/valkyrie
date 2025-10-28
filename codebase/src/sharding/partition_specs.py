@@ -11,6 +11,9 @@ from jax.sharding import PartitionSpec as P
 from typing import Optional, Dict, Any
 import logging
 
+# Import TrainingState for sharding spec structure
+from ..train.data_structures import TrainingState
+
 logger = logging.getLogger(__name__)
 
 # Logical axis names matching mesh_setup.py
@@ -274,29 +277,24 @@ SIMPLE_1D_CONFIG = {
 }
 
 
-def get_training_specs(model_specs: Dict[str, Any]) -> Dict[str, Any]:
+def get_training_specs(model_specs: Dict[str, Any]) -> TrainingState:
     """
     Get PartitionSpecs for training state (TrainingState).
-    
-    Note: We intentionally do NOT specify opt_state sharding here.
-    The optimizer state structure depends on the specific optimizer chain
-    (e.g., optax.chain with clip_by_global_norm + adamw) and should be
-    inferred by JAX to avoid pytree structure mismatches.
     
     Args:
         model_specs: Model parameter PartitionSpecs from get_model_specs()
         
     Returns:
-        PartitionSpecs for TrainingState fields
+        A TrainingState object with PartitionSpecs for each field.
     """
-    return {
-        'params': model_specs,
-        # opt_state: Intentionally omitted - let JAX infer sharding
-        'step': REPLICATED,
-        'rng': REPLICATED,
-        's5_states': REPLICATED,  # Keep S5 states replicated for now
-        'chunk_position': REPLICATED,
-        'phase_index': REPLICATED,
-        'hrm_enabled': REPLICATED,
-        'hrm_training_state': REPLICATED,
-    }
+    return TrainingState(
+        params=model_specs,
+        opt_state=None,  # Let JAX infer sharding for the optimizer state
+        step=REPLICATED,
+        rng=REPLICATED,
+        s5_states=REPLICATED,
+        chunk_position=REPLICATED,
+        phase_index=REPLICATED,
+        hrm_enabled=REPLICATED,
+        hrm_training_state=REPLICATED,
+    )

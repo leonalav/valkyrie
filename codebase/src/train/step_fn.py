@@ -74,6 +74,13 @@ def create_train_step(
             input_ids = batch['input_ids']
             labels = batch.get('labels', None)
             
+            # Early validation checks
+            assert input_ids.dtype == jnp.int32, f"input_ids must be int32, got {input_ids.dtype}"
+            max_token_id = int(input_ids.max())
+            if max_token_id >= config.vocab_size:
+                raise ValueError(f"Token id {max_token_id} >= vocab_size {config.vocab_size}. "
+                               "Tokenizer/model mismatch (e.g., GPT-2 tokens with 32k model).")
+            
             # If no labels provided, create them by shifting input_ids
             if labels is None:
                 batch_size, seq_len = input_ids.shape
@@ -157,16 +164,23 @@ def create_train_step(
         
         return new_state, metrics
     
-    # Compile with pjit
+    # Get training specs for explicit sharding (matches initialization)
+    training_specs = get_training_specs(model_specs)
+    
+    # Determine batch sharding based on mesh configuration
+    # If mesh.z == 1, batch should be replicated, otherwise shard on DP
+    batch_spec = P(DP, None) if mesh.shape[mesh.axis_names.index('z')] > 1 else P()
+    
+    # Compile with pjit using explicit sharding specs (matches parameter initialization)
     compiled_train_step = pjit.pjit(
         train_step_fn,
-        in_axis_resources=(
-            training_specs,           # state
-            P(DP, None),             # batch (sharded along batch dimension)
+        in_shardings=(
+            training_specs,          # state - use explicit sharding specs that match initialization
+            batch_spec,              # batch (sharded along batch dimension if multi-host)
             P(),                     # dropout_rng (replicated)
         ),
-        out_axis_resources=(
-            training_specs,           # new_state
+        out_shardings=(
+            training_specs,          # new_state - use same explicit sharding specs
             P(),                     # metrics (replicated)
         ),
         donate_argnums=(0,),         # Donate state for memory efficiency
@@ -266,15 +280,15 @@ def create_eval_step(
         
         return metrics
     
-    # Compile with pjit
+    # Compile with pjit using param-inferred sharding
     compiled_eval_step = pjit.pjit(
         eval_step_fn,
-        in_axis_resources=(
-            model_specs,             # params
-            P(DP, None),            # batch
+        in_shardings=(
+            None,                    # params - let arrays' own sharding drive compilation
+            P('z', None),           # batch
             P() if config.use_s5 else None,  # s5_states
         ),
-        out_axis_resources=P(),      # metrics (replicated)
+        out_shardings=P(),           # metrics (replicated)
     )
     
     return compiled_eval_step
@@ -309,7 +323,7 @@ def create_chunked_train_step(
     """
     
     # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=True)
+    model_specs = get_model_specs(config, use_2d_sharding=False)
     training_specs = get_training_specs(model_specs)
     
     def chunked_train_step_fn(
@@ -389,10 +403,7 @@ def create_chunked_train_step(
             total_loss += chunk_loss / num_chunks
             s5_states = new_s5_states
         
-        # Apply additional gradient clipping for numerical stability
-        accumulated_grads = jax.tree_util.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), accumulated_grads)
-        
-        # Apply gradient clipping
+        # Apply gradient clipping (global norm only)
         grad_norm = optax.global_norm(accumulated_grads)
         accumulated_grads = optax.clip_by_global_norm(config.gradient_clipping)(
             accumulated_grads, state['opt_state'], state['params']
@@ -425,17 +436,17 @@ def create_chunked_train_step(
         
         return new_state, metrics
     
-    # Compile with pjit
+    # Compile with pjit using param-inferred sharding
     compiled_chunked_step = pjit.pjit(
         chunked_train_step_fn,
-        in_axis_resources=(
-            training_specs,
-            P(DP, None),
-            P(),
+        in_shardings=(
+            None,                    # state - let arrays' own sharding drive compilation
+            P('z', None),           # batch
+            P(),                     # dropout_rng
         ),
-        out_axis_resources=(
-            training_specs,
-            P(),
+        out_shardings=(
+            None,                    # new_state - infer from computation
+            P(),                     # metrics
         ),
         donate_argnums=(0,),
     )
@@ -460,7 +471,7 @@ def create_generation_step(
         Compiled generation step function
     """
     
-    model_specs = get_model_specs(config, use_2d_sharding=True)
+    model_specs = get_model_specs(config, use_2d_sharding=False)
     
     def generation_step_fn(
         params: Dict[str, Any],
@@ -513,12 +524,12 @@ def create_generation_step(
             outputs.get('s5_states', None)
         )
     
-    # Compile with pjit
+    # Compile with pjit using param-inferred sharding
     compiled_generation_step = pjit.pjit(
         generation_step_fn,
-        in_axis_resources=(
-            model_specs,                    # params
-            P(DP, None),                   # input_ids
+        in_shardings=(
+            None,                          # params - let arrays' own sharding drive compilation
+            P('z', None),                 # input_ids
             P() if config.use_longformer_attention else P(),  # past_key_values
             P() if config.use_s5 else None,  # s5_states
             P(),                           # temperature
@@ -526,8 +537,8 @@ def create_generation_step(
             P(),                           # top_p
             P(),                           # rng_key
         ),
-        out_axis_resources=(
-            P(DP, None),                   # next_token
+        out_shardings=(
+            P('z', None),                 # next_token
             P() if config.use_longformer_attention else P(),  # new_past_key_values
             P() if config.use_s5 else None,  # new_s5_states
         ),

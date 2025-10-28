@@ -134,18 +134,7 @@ class CurriculumConfig:
             ]
 
 
-class TrainingState(NamedTuple):
-    """Training state with S5 states, chunking info, and HRM integration."""
-    params: Any
-    opt_state: Any
-    step: int
-    rng: jax.random.PRNGKey
-    s5_states: Optional[List[jnp.ndarray]] = None
-    chunk_position: int = 0
-    phase_index: int = 0
-    # HRM-specific state
-    hrm_enabled: bool = False
-    hrm_training_state: Optional[Any] = None  # HRMTrainingState when enabled
+from .data_structures import TrainingState
 
 
 class TrainingLoop:
@@ -465,9 +454,8 @@ class TrainingLoop:
         # Compile with pjit
         self.train_step = pjit.pjit(
             train_step_fn,
-            in_shardings=(None, P(DP, None)),  # state, batch (phase_config is static)
-            out_shardings=(None, P()),        # new_state, metrics
-            donate_argnums=(0,),  # Donate state for memory efficiency
+            in_shardings=(self.training_specs, P(DP, None)),  # state, batch (phase_config is static)
+            out_shardings=(self.training_specs, P()),        # new_state, metrics
             static_argnums=(2,)   # phase_config is static
         )
     
@@ -583,6 +571,7 @@ class TrainingLoop:
             s5_states=s5_states,
             chunk_position=0,
             phase_index=0,
+            hrm_enabled=False,
         )
     
     def train_epoch(

@@ -95,7 +95,7 @@ class CheckpointManager:
         logger.info(f"  Keep checkpoints: {config.keep_checkpoints}")
     
     def _setup_checkpointers(self):
-        """Setup Orbax checkpointers."""
+        """Setup Orbax checkpointers using current API."""
         
         # Main checkpointer for parameters and optimizer state
         checkpointer_options = ocp.CheckpointManagerOptions(
@@ -105,15 +105,16 @@ class CheckpointManager:
         )
         
         if self.config.async_save:
-            self.checkpointer = AsyncCheckpointer(
+            # Use current Orbax API for async checkpointing
+            self.checkpointer = ocp.AsyncCheckpointer(
                 ocp.StandardCheckpointHandler(),
                 timeout_secs=300,  # 5 minute timeout
             )
         else:
-            self.checkpointer = PyTreeCheckpointer()
+            self.checkpointer = ocp.StandardCheckpointer()
         
         # Fast checkpointer for frequent saves (params only)
-        self.fast_checkpointer = PyTreeCheckpointer()
+        self.fast_checkpointer = ocp.StandardCheckpointer()
         
         logger.info("✓ Checkpointers initialized")
     
@@ -158,28 +159,32 @@ class CheckpointManager:
     
     def save(
         self,
-        state: Dict[str, Any],
+        state: Any,  # Changed from Dict[str, Any] to Any to support NamedTuple
         step: Optional[int] = None,
         checkpoint_type: str = "full",
-        force_sync: bool = False,
+        path: Optional[Union[str, Path]] = None,
     ) -> bool:
         """
-        Save checkpoint with proper sharding.
+        Save checkpoint with proper sharding and error handling.
         
         Args:
             state: Training state to save
-            step: Training step (extracted from state if None)
+            step: Training step (uses state.step if None)
             checkpoint_type: Type of checkpoint ("full" or "fast")
-            force_sync: Force synchronous save
+            path: Custom checkpoint path
             
         Returns:
-            True if save was successful
+            True if successful, False otherwise
         """
         
         if step is None:
             step = getattr(state, 'step', 0)
         
-        checkpoint_path = self._get_checkpoint_path(step, checkpoint_type)
+        # Determine checkpoint path
+        if path is not None:
+            checkpoint_path = Path(path)
+        else:
+            checkpoint_path = self._get_checkpoint_path(step, checkpoint_type)
         
         logger.info(f"Saving {checkpoint_type} checkpoint at step {step}: {checkpoint_path}")
         
@@ -187,19 +192,17 @@ class CheckpointManager:
             # Prepare checkpoint data
             checkpoint_data = self._prepare_checkpoint_data(state, checkpoint_type)
             
-            # Save with appropriate checkpointer
+            # Create checkpoint directory
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save checkpoint with proper error handling and cleanup
             if checkpoint_type == "fast":
-                # Fast checkpoint (synchronous, params only)
-                self.fast_checkpointer.save(checkpoint_path, checkpoint_data)
+                self.fast_checkpointer.save(checkpoint_path, args=ocp.args.StandardSave(checkpoint_data))
             else:
-                # Full checkpoint (async if enabled)
-                if self.config.async_save and not force_sync:
-                    # Async save
-                    save_future = self.checkpointer.save(checkpoint_path, checkpoint_data)
-                    # Don't wait for completion in async mode
+                if self.config.async_save:
+                    self.checkpointer.save(checkpoint_path, args=ocp.args.StandardSave(checkpoint_data))
                 else:
-                    # Sync save
-                    self.checkpointer.save(checkpoint_path, checkpoint_data)
+                    self.checkpointer.save(checkpoint_path, args=ocp.args.StandardSave(checkpoint_data))
             
             # Update manifest
             checkpoint_info = {
@@ -228,6 +231,8 @@ class CheckpointManager:
             
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
+            # CRITICAL FIX: Add proper Orbax checkpoint cleanup on failure
+            self._cleanup_failed_checkpoint(checkpoint_path)
             return False
     
     def load(
@@ -264,11 +269,15 @@ class CheckpointManager:
         logger.info(f"Loading checkpoint: {checkpoint_path}")
         
         try:
-            # Load checkpoint data
+            # Load checkpoint data - need to provide abstract structure for restore
             if checkpoint_type == "fast":
-                checkpoint_data = self.fast_checkpointer.restore(checkpoint_path)
+                # For fast checkpoints, we typically only save params
+                abstract_state = {'params': None}  # Placeholder structure
+                checkpoint_data = self.fast_checkpointer.restore(checkpoint_path, args=ocp.args.StandardRestore(abstract_state))
             else:
-                checkpoint_data = self.checkpointer.restore(checkpoint_path)
+                # For full checkpoints, we need the full state structure
+                abstract_state = {'params': None, 'opt_state': None, 'step': None}  # Placeholder structure
+                checkpoint_data = self.checkpointer.restore(checkpoint_path, args=ocp.args.StandardRestore(abstract_state))
             
             # Validate checkpoint if enabled
             if self.config.validate_on_load:
@@ -583,3 +592,41 @@ class CheckpointManager:
             logger.warning(f"Failed to calculate disk usage: {e}")
         
         return stats
+    
+    def _cleanup_failed_checkpoint(self, step: int, checkpoint_type: str = "unknown") -> None:
+        """Clean up failed checkpoint artifacts and update manifest.
+        
+        Args:
+            step: The step number of the failed checkpoint
+            checkpoint_type: Type of checkpoint that failed ("fast" or "full")
+        """
+        try:
+            # Remove any partially created checkpoint directory
+            checkpoint_path = self.checkpoint_dir / f"checkpoint_{step}"
+            if checkpoint_path.exists():
+                import shutil
+                shutil.rmtree(checkpoint_path, ignore_errors=True)
+                logger.info(f"Removed failed {checkpoint_type} checkpoint directory: {checkpoint_path}")
+            
+            # Cancel any pending async operations for this step
+            if hasattr(self, '_async_futures'):
+                futures_to_cancel = []
+                for future in getattr(self, '_async_futures', []):
+                    if not future.done():
+                        future.cancel()
+                        futures_to_cancel.append(future)
+                
+                if futures_to_cancel:
+                    logger.info(f"Cancelled {len(futures_to_cancel)} pending async operations")
+            
+            # Update manifest to remove any reference to this failed checkpoint
+            if hasattr(self, 'saved_checkpoints'):
+                self.saved_checkpoints = [
+                    cp for cp in self.saved_checkpoints 
+                    if not cp['path'].endswith(f"checkpoint_{step}")
+                ]
+                self._update_manifest()
+                
+        except Exception as cleanup_error:
+            logger.error(f"Error during checkpoint cleanup for step {step}: {cleanup_error}")
+            # Don't re-raise - cleanup errors shouldn't crash the training

@@ -1068,7 +1068,7 @@ class S5(nn.Module):
             C_xk_real = jnp.real(C_xk).astype(jnp.float32)
             y_k = C_xk_real + self.D[None, :] * u_k
         
-        # Cast to real before GELU to avoid complex tensor warnings and improve XLA compatibility
+        # EXPLICIT CAST: Cast to real before GELU to avoid complex tensor warnings and improve XLA compatibility
         y_k = jnp.real(y_k).astype(jnp.float32)
         y_k = jax.nn.gelu(y_k)
         
@@ -1189,7 +1189,7 @@ class S5(nn.Module):
                 ys = C_xs_real + self.D[None, None, :] * u_masked  # Use masked input for consistency
             
             # 4. Apply nonlinearity (GELU as mentioned in ssm_scan.txt)
-            # Cast to real before GELU to avoid complex tensor warnings and improve XLA compatibility
+            # EXPLICIT CAST: Cast to real before GELU to avoid complex tensor warnings and improve XLA compatibility
             ys = jnp.real(ys).astype(jnp.float32)
             ys = jax.nn.gelu(ys)
             
