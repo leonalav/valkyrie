@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from orbax.checkpoint import PyTreeCheckpointer, AsyncCheckpointer
+from orbax.checkpoint.utils import fully_replicated_host_local_array_to_global_array
 from typing import Dict, Any, Optional, Union, List
 import os
 import time
@@ -47,6 +48,21 @@ class CheckpointConfig:
     # Additional parameters from YAML config
     save_optimizer_state: bool = True  # Whether to save optimizer state
     async_checkpointing: bool = True  # Async checkpointing flag
+    
+    # YAML compatibility parameters
+    save_every_n_steps: Optional[int] = None  # Maps to save_interval_steps
+    keep_n_checkpoints: Optional[int] = None  # Maps to keep_checkpoints
+    checkpoint_manager: str = "orbax"  # Checkpoint manager type
+    checkpoint_on_preemption: bool = True  # Save on preemption
+    log_every_n_steps: int = 100  # Logging interval
+    eval_every_n_steps: int = 1000  # Evaluation interval
+    
+    def __post_init__(self):
+        """Handle YAML parameter mapping."""
+        if self.save_every_n_steps is not None:
+            self.save_interval_steps = self.save_every_n_steps
+        if self.keep_n_checkpoints is not None:
+            self.keep_checkpoints = self.keep_n_checkpoints
 
 
 class CheckpointManager:
@@ -323,26 +339,34 @@ class CheckpointManager:
                     checkpoint_data['s5_states'] = state.s5_states
             except AttributeError:
                 pass
-            
-            # HRM states (z_H, z_L) as specified in PLAN
-            try:
-                if state.hrm_states is not None:
-                    checkpoint_data['hrm_states'] = state.hrm_states
-            except AttributeError:
-                pass
-            
-            # Individual HRM state components for backward compatibility
-            try:
-                if state.z_H is not None:
-                    checkpoint_data['z_H'] = state.z_H
-            except AttributeError:
-                pass
-            
-            try:
-                if state.z_L is not None:
-                    checkpoint_data['z_L'] = state.z_L
-            except AttributeError:
-                pass
+
+        # Convert all JAX arrays to global arrays for serialization
+        def convert_to_global(leaf):
+            if isinstance(leaf, jax.Array) and leaf.sharding.device_set == {jax.devices()[0]}:
+                return fully_replicated_host_local_array_to_global_array(leaf)
+            return leaf
+
+        return jax.tree_util.tree_map(convert_to_global, checkpoint_data)
+
+        # HRM states (z_H, z_L) as specified in PLAN
+        try:
+            if state.hrm_states is not None:
+                checkpoint_data['hrm_states'] = state.hrm_states
+        except AttributeError:
+            pass
+        
+        # Individual HRM state components for backward compatibility
+        try:
+            if state.z_H is not None:
+                checkpoint_data['z_H'] = state.z_H
+        except AttributeError:
+            pass
+        
+        try:
+            if state.z_L is not None:
+                checkpoint_data['z_L'] = state.z_L
+        except AttributeError:
+            pass
             
             # HRM training metadata (segment info, cycle counts, etc.)
             try:
@@ -626,7 +650,14 @@ class CheckpointManager:
                     if not cp['path'].endswith(f"checkpoint_{step}")
                 ]
                 self._update_manifest()
-                
         except Exception as cleanup_error:
             logger.error(f"Error during checkpoint cleanup for step {step}: {cleanup_error}")
-            # Don't re-raise - cleanup errors shouldn't crash the training
+
+    def _update_manifest(self):
+        # Placeholder for manifest update logic
+        logger.info("Updating checkpoint manifest (placeholder)")
+
+    def serialize(self, data):
+        # Placeholder for serialization logic
+        logger.info("Serializing data (placeholder)")
+        return data

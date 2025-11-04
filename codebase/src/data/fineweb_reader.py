@@ -106,7 +106,6 @@ class FineWebDataset:
                 name=self.config.dataset_config,
                 split=self.config.split,
                 streaming=self.config.streaming,
-                trust_remote_code=True,
             )
             
             logger.info("✓ Dataset loaded successfully")
@@ -190,7 +189,9 @@ class FineWebDataset:
                         break
                     
                     try:
-                        self._chunk_buffer.put(chunk, timeout=1.0)
+                        # Create dictionary with input_ids
+                        chunk_dict = {'input_ids': chunk}
+                        self._chunk_buffer.put(chunk_dict, timeout=1.0)
                     except queue.Full:
                         # Buffer full, skip this chunk
                         logger.warning("Chunk buffer full, skipping chunk")

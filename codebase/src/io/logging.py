@@ -12,7 +12,7 @@ import jax
 import logging
 import sys
 import time
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
 from pathlib import Path
 import json
 from dataclasses import dataclass, asdict
@@ -51,12 +51,18 @@ class LoggingConfig:
     # Multi-host coordination
     aggregate_logs: bool = True
     primary_host_only: bool = False
+    log_host_metrics: bool = False  # Added for YAML compatibility
+    aggregate_host_logs: bool = True  # Added for YAML compatibility
     
     # Wandb integration
     use_wandb: bool = False
     wandb_project: str = "valkyrie-training"
     wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None
+    
+    # Additional monitoring options from YAML
+    profile_steps: Optional[List[int]] = None
+    memory_profiling: bool = False
 
 
 class MultiHostLogger:
@@ -238,7 +244,8 @@ class MultiHostLogger:
             enriched_metrics['step'] = step
         
         # Log to console/file
-        self.logger.info(f"Metrics: {json.dumps(enriched_metrics, indent=2)}")
+        if self.is_primary_host:
+            self.logger.info(f"Metrics: {json.dumps(enriched_metrics, indent=2)}")
         
         # Add to metrics buffer
         self._log_metrics('training_metrics', enriched_metrics)

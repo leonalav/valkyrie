@@ -16,23 +16,33 @@ import argparse
 import logging
 import time
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Iterator
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (optional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv not available, skip loading .env file
+    pass
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add codebase to path if running directly
+current_file = Path(__file__).resolve()
+codebase_dir = current_file.parent.parent.parent  # src/train/main.py -> src/train -> src -> codebase
+if str(codebase_dir) not in sys.path:
+    sys.path.insert(0, str(codebase_dir))
 
-from ..model import ValkyrieModel, ValkyrieConfig
-from ..sharding import make_mesh, get_mesh_context, get_model_specs
-from ..data.multi_source_loader import PackedSequence
-from .train_loop import TrainingLoop, ChunkConfig, CurriculumConfig
-from ..data import create_data_loader, MultiSourceConfig, MultiSourceDataLoader, DataSourceConfig, TokenizerConfig, create_plan_data_loader
-from ..io import CheckpointManager, CheckpointConfig, setup_logging, LoggingConfig
-from ..utils.debug import (
+# Use absolute imports
+from src.model import ValkyrieModel, ValkyrieConfig
+from src.sharding import make_mesh, get_mesh_context, get_model_specs
+# from src.data.multi_source_loader import PackedSequence  # Commented out until implemented
+from src.train.train_loop import TrainingLoop, ChunkConfig, CurriculumConfig
+# from src.data import create_data_loader, MultiSourceConfig, MultiSourceDataLoader, DataSourceConfig, TokenizerConfig, create_plan_data_loader  # Commented out until implemented
+from src.data import create_data_loader, TokenizerConfig
+from src.io import CheckpointManager, CheckpointConfig, setup_logging, LoggingConfig
+from src.utils.debug import (
     get_tpu_mixed_precision_config, 
     MixedPrecisionPolicy,
     print_param_stats,
@@ -84,11 +94,11 @@ def create_model_from_config(config: Dict[str, Any]) -> ValkyrieModel:
     return model
 
 
-def convert_packed_sequences_to_batch(packed_sequences: List[PackedSequence]) -> Dict[str, jnp.ndarray]:
-    """Convert List[PackedSequence] to batch dictionary with only fields used by training.
+def convert_packed_sequences_to_batch(packed_sequences: List[Dict]) -> Dict[str, jnp.ndarray]:
+    """Convert List[Dict] to batch dictionary with only fields used by training.
     
     Args:
-        packed_sequences: List of PackedSequence namedtuples
+        packed_sequences: List of sequence dictionaries
         
     Returns:
         Dictionary with only the fields used by train_step:
@@ -105,9 +115,9 @@ def convert_packed_sequences_to_batch(packed_sequences: List[PackedSequence]) ->
     }
 
 
-def create_batch_iterator(data_loader, batch_size: int, rng_key: jax.random.PRNGKey) -> Iterator[Dict[str, jnp.ndarray]]:
-    """Create iterator that converts List[PackedSequence] to proper batch format."""
-    for packed_batch in data_loader.stream_batches(batch_size=batch_size, rng_key=rng_key):
+def create_batch_iterator(data_loader) -> Iterator[Dict[str, jnp.ndarray]]:
+#     """Create iterator that converts List[PackedSequence] to proper batch format."""
+    for packed_batch in data_loader.get_batch_iterator():
         yield convert_packed_sequences_to_batch(packed_batch)
 
 
@@ -116,7 +126,10 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     
     # Setup TPU mesh
     logger.info("Setting up TPU mesh...")
-    mesh = make_mesh()
+    mesh_config = config.get('mesh', {})
+    topology = tuple(mesh_config.get('mesh_shape', [4, 4, 2]))
+    axis_names = tuple(mesh_config.get('axis_names', ['data', 'model', 'fsdp']))
+    mesh = make_mesh(topology=topology, axis_names=axis_names)
     
     # Setup mixed precision policy
     logger.info("Setting up mixed precision policy...")
@@ -126,21 +139,28 @@ def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
     # Setup data pipeline
     logger.info("Setting up data pipeline...")
     
-    # Convert source dictionaries to DataSourceConfig objects
-    sources = []
-    for source_dict in config['data']['sources']:
-        source_config = DataSourceConfig(**source_dict)
-        sources.append(source_config)
+    # For now, use simple data loader since multi-source components are not available
+    # TODO: Implement full multi-source pipeline when components are available
+    tokenizer_config = TokenizerConfig(
+        tokenizer_name=config['data']['tokenizer_name'],
+        vocab_size=config['data']['vocab_size']
+    )
     
-    # Create data config with converted sources
-    data_config_dict = config['data'].copy()
-    data_config_dict['sources'] = sources
-    data_config = MultiSourceConfig(**data_config_dict)
+    # Create FineWeb config for simple data loader testing
+    from src.data.fineweb_reader import FineWebConfig
+    fineweb_config = FineWebConfig(
+        dataset_name="HuggingFaceFW/fineweb",
+        dataset_config="sample-10BT",  # Use smaller sample for testing
+        batch_size=config['training']['global_batch_size'],
+        chunk_size=config['model']['max_position_embeddings'],
+        streaming=True
+    )
     
-    tokenizer_config = TokenizerConfig(**config['tokenizer'])
-    
-    # Create data loader with custom configuration
-    data_loader = MultiSourceDataLoader(data_config)
+    # Create simple data loader for testing
+    data_loader = create_data_loader(
+        config=fineweb_config,
+        tokenizer_config=tokenizer_config
+    )
     
     # Setup checkpointing
     logger.info("Setting up checkpointing...")
@@ -214,6 +234,174 @@ def run_validation_tests(model: ValkyrieModel, config: Dict[str, Any]) -> bool:
         return False
 
 
+def run_tpu_v4_32_test(model: ValkyrieModel, training_state, config: Dict[str, Any], mesh) -> bool:
+    """Run comprehensive TPU v4-32 validation test with enhanced functionality from examples."""
+    
+    logger.info("=== TPU v4-32 Comprehensive Validation Test ===")
+    
+    try:
+        from src.train.step_fn import create_train_step, create_eval_step
+        from src.sharding.distributed_init import print_distributed_info
+        
+        # Step 1: Validate distributed setup
+        logger.info("=== Step 1: Distributed Setup Validation ===")
+        print_distributed_info()
+        
+        # Step 2: Validate mesh configuration
+        logger.info("=== Step 2: Mesh Configuration Validation ===")
+        expected_shape = tuple(config['mesh']['mesh_shape'])  # (4, 4)
+        expected_axes = tuple(config['mesh']['axis_names'])   # ('data', 'model')
+        
+        # Convert mesh.shape (OrderedDict) to tuple for comparison
+        actual_shape = tuple(mesh.shape.values())
+        
+        if actual_shape != expected_shape:
+            raise ValueError(f"Expected mesh shape {expected_shape}, got {actual_shape}")
+        if mesh.axis_names != expected_axes:
+            raise ValueError(f"Expected axis names {expected_axes}, got {mesh.axis_names}")
+        
+        logger.info(f"✓ Mesh configuration verified: shape={actual_shape}, axes={mesh.axis_names}")
+        
+        # Step 3: Create enhanced synthetic batch
+        logger.info("=== Step 3: Synthetic Batch Creation ===")
+        batch_size = config['training']['global_batch_size']  # Use global batch size
+        seq_length = min(config['data']['max_length'], 2048)  # Cap for testing
+        vocab_size = config['model']['vocab_size']
+        
+        # Create synthetic data with proper attention mask
+        rng = jax.random.PRNGKey(42)
+        input_ids = jax.random.randint(
+            rng, (batch_size, seq_length), 0, vocab_size, dtype=jnp.int32
+        )
+        attention_mask = jnp.ones((batch_size, seq_length), dtype=jnp.bool_)
+        labels = input_ids  # For language modeling
+        
+        batch = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,
+        }
+        
+        # Verify batch sharding
+        with mesh:
+            local_batch_size = batch_size // mesh.shape['data']  # Divide by data parallel dimension
+            logger.info(f"Global batch size: {batch_size}, Local batch size: {local_batch_size}")
+            logger.info(f"Batch shapes: input_ids={batch['input_ids'].shape}")
+        
+        # Step 4: Count model parameters
+        logger.info("=== Step 4: Model Parameter Analysis ===")
+        param_count = sum(x.size for x in jax.tree_util.tree_leaves(training_state.params))
+        logger.info(f"Model parameters: {param_count:,} ({param_count/1e9:.2f}B)")
+        
+        # Step 5: Create step functions with enhanced configuration
+        logger.info("=== Step 5: Step Function Creation ===")
+        with mesh:
+            # Create training step function with 3D mesh support
+            train_step_fn = create_train_step(
+                model=model,
+                optimizer=None,  # We'll pass the optimizer separately since it's in opt_state
+                config=model.config,
+                mesh=mesh,
+                mixed_precision=config['training'].get('use_mixed_precision', True),
+                use_2d_sharding=config['sharding'].get('model_parallel', {}).get('type') == '2d_tensor_parallel',
+                use_3d_mesh=config['sharding'].get('use_3d_sharding', True)
+            )
+            
+            # Create evaluation step function
+            eval_step_fn = create_eval_step(
+                model=model,
+                config=model.config,
+                mesh=mesh,
+                mixed_precision=config['training'].get('use_mixed_precision', True),
+                use_2d_sharding=config['sharding'].get('model_parallel', {}).get('type') == '2d_tensor_parallel',
+                use_3d_mesh=config['sharding'].get('use_3d_sharding', True)
+            )
+        
+        # Step 6: Single training step test with timing
+        logger.info("=== Step 6: Single Training Step Test ===")
+        with mesh:
+            start_time = time.time()
+            # Generate dropout RNG key
+            dropout_rng = jax.random.fold_in(training_state.rng, training_state.step)
+            new_state, train_metrics = train_step_fn(training_state, batch, dropout_rng)
+            step_time = time.time() - start_time
+            
+            # Add timing metrics
+            train_metrics['step_time_ms'] = step_time * 1000
+            train_metrics['tokens_per_second'] = (batch['input_ids'].size / step_time)
+            
+            logger.info("Training step completed successfully!")
+            logger.info(f"  Loss: {train_metrics.get('loss', 'N/A'):.4f}")
+            logger.info(f"  Learning rate: {train_metrics.get('learning_rate', 'N/A')}")
+            logger.info(f"  Step time: {train_metrics.get('step_time_ms', 'N/A'):.1f}ms")
+            logger.info(f"  Tokens/sec: {train_metrics.get('tokens_per_second', 'N/A'):.0f}")
+        
+        # Step 7: Evaluation step test with timing
+        logger.info("=== Step 7: Evaluation Step Test ===")
+        with mesh:
+            start_time = time.time()
+            eval_metrics = eval_step_fn(new_state, batch)
+            eval_time = time.time() - start_time
+            
+            eval_metrics['eval_time_ms'] = eval_time * 1000
+            
+            logger.info("Evaluation step completed successfully!")
+            logger.info(f"  Eval loss: {eval_metrics.get('loss', 'N/A'):.4f}")
+            logger.info(f"  Accuracy: {eval_metrics.get('accuracy', 'N/A'):.4f}")
+            logger.info(f"  Perplexity: {eval_metrics.get('perplexity', 'N/A'):.2f}")
+            logger.info(f"  Eval time: {eval_metrics.get('eval_time_ms', 'N/A'):.1f}ms")
+        
+        # Step 8: Multi-step training test
+        logger.info("=== Step 8: Multi-Step Training Test ===")
+        num_steps = 5
+        
+        current_state = new_state
+        step_times = []
+        
+        for step in range(num_steps):
+            with mesh:
+                start_time = time.time()
+                current_state, step_metrics = train_step_fn(current_state, batch)
+                step_time = time.time() - start_time
+                step_times.append(step_time)
+                
+                logger.info(f"  Step {step+1}/{num_steps}: "
+                           f"loss={step_metrics.get('loss', 'N/A'):.4f}, "
+                           f"time={step_time*1000:.1f}ms")
+        
+        # Calculate average step time
+        avg_step_time = sum(step_times) / len(step_times)
+        logger.info(f"Multi-step training completed! Average step time: {avg_step_time*1000:.1f}ms")
+        
+        # Step 9: Performance summary
+        logger.info("=== Step 9: Performance Summary ===")
+        final_metrics = {
+            'mesh_shape': mesh.shape,
+            'mesh_axes': mesh.axis_names,
+            'model_params': param_count,
+            'global_batch_size': batch_size,
+            'local_batch_size': batch_size // mesh.shape[0],
+            'sequence_length': seq_length,
+            'final_loss': step_metrics.get('loss', 'N/A'),
+            'avg_step_time_ms': avg_step_time * 1000,
+            'tokens_per_second': (batch['input_ids'].size / avg_step_time),
+            'memory_efficient': config['sharding'].get('use_fsdp', False),
+        }
+        
+        logger.info("=== FINAL TPU v4-32 TEST RESULTS ===")
+        for key, value in final_metrics.items():
+            logger.info(f"  {key}: {value}")
+        
+        logger.info("✓ TPU v4-32 comprehensive test completed successfully! 🎉")
+        return True
+            
+    except Exception as e:
+        import traceback
+        logger.error(f"TPU v4-32 test failed: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return False
+
+
 def main():
     """Main training function."""
     
@@ -225,6 +413,8 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--validate_only", action="store_true", help="Run validation tests only")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--tpu_v4_32_test", action="store_true", help="Run TPU v4-32 specific validation test")
+    parser.add_argument("--synthetic_data", action="store_true", help="Use synthetic data for testing")
     
     args = parser.parse_args()
     
@@ -234,6 +424,14 @@ def main():
     except Exception as e:
         print(f"❌ Failed to load configuration: {e}")
         return 1
+    
+    # Initialize JAX distributed system early (required for multi-host TPU)
+    try:
+        jax.distributed.initialize()
+        print(f"✓ JAX distributed initialized - Process {jax.process_index()}/{jax.process_count()}")
+    except Exception as e:
+        print(f"⚠️  JAX distributed initialization failed: {e}")
+        # Continue anyway for single-host setups
     
     # Override config with command line arguments
     if args.checkpoint_dir:
@@ -301,6 +499,17 @@ def main():
             logger.info("Validation complete, exiting")
             return 0
         
+        # Run TPU v4-32 specific test if requested
+        if args.tpu_v4_32_test:
+            logger.info("Running TPU v4-32 specific validation test...")
+            success = run_tpu_v4_32_test(model, training_state, config, components['mesh'])
+            if success:
+                logger.info("TPU v4-32 test completed successfully")
+            else:
+                logger.error("TPU v4-32 test failed")
+                return 1
+            return 0
+        
         # Resume from checkpoint if specified
         if args.resume_from:
             logger.info(f"Resuming from checkpoint: {args.resume_from}")
@@ -315,8 +524,8 @@ def main():
         # Log training start
         total_steps = config['training']['total_steps']
         # dataset_info = components['data_loader'].get_stats()  # Method doesn't exist, skip for now
-        dataset_info = {"sources": len(components['data_loader'].sources)}  # Simple fallback
-        multi_logger.log_training_start(total_steps, dataset_info)
+#         dataset_info = {"sources": len(components['data_loader'].sources)}  # Simple fallback
+#         multi_logger.log_training_start(total_steps, dataset_info)
         
         # Main training loop
         logger.info("Starting training...")
@@ -326,11 +535,7 @@ def main():
             # Create data iterator with batch conversion
             batch_size = config['training']['micro_batch_size']
             rng_key = jax.random.PRNGKey(42)  # Default seed since not in config
-            data_iterator = create_batch_iterator(
-                components['data_loader'], 
-                batch_size=batch_size,
-                rng_key=rng_key
-            )
+            data_iterator = create_batch_iterator(components['data_loader'])
             
             # Train for specified steps
             final_state = components['training_loop'].train_epoch(

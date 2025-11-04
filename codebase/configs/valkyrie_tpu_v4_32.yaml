@@ -1,0 +1,329 @@
+# Valkyrie TPU v4-32 Configuration
+# Optimized for 32-chip TPU v4 pod with 3D mesh topology (4 hosts × 8 chips)
+# Multi-host distributed training with FSDP + model parallelism
+
+# Include base model configuration
+model:
+  # Model architecture - Valkyrie with BigBird + S5 + HRM (Blueprint Config B: 1.2B params)
+  vocab_size: 50257   # GPT-2 tokenizer vocab size
+  d_model: 1536       # Model dimension (Config B)
+  n_layers: 36        # Number of transformer layers (Config B for 1.2B params)
+  n_heads: 24         # Number of attention heads (Config B)
+  n_kv_heads: 24      # Number of key-value heads (for GQA)
+  
+  # Context and position embeddings
+  max_position_embeddings: 65536  # 64k context length
+  original_max_position_embeddings: 4096
+  rope_theta: 10000.0
+  yarn_beta_fast: 32.0
+  yarn_beta_slow: 1.0
+  
+  # Dropout rates
+  attn_dropout: 0.0
+  resid_dropout: 0.0
+  ffn_dropout: 0.1
+  
+  # Model configuration
+  use_bias: false
+  layer_norm_eps: 1.0e-5
+  initializer_range: 0.02
+  
+  # S5 configuration (State-Space Model)
+  s5_state_dim: 768   # State dimension for S5 layers (Config B)
+  use_s5: true        # Enable S5 layers
+  
+  # Training configuration
+  gradient_clipping: 1.0
+  weight_decay: 0.1
+  gradient_checkpointing: true
+  
+  # BigBird sparse attention configuration
+  use_bigbird_attention: true
+  bigbird_block_size: 128        # Block size for 64k context (b=128)
+  bigbird_num_global_tokens: 16  # Global tokens (g=16) - used by HRM planner
+  bigbird_num_window_blocks: 3   # Window blocks (w=3)
+  bigbird_num_random_blocks: 3   # Random blocks (r=3)
+  bigbird_use_blockified_gemm: true  # Use blockified GEMM path for TPU efficiency
+  
+  # HRM (Hierarchical Reasoning Model) configuration
+  use_hrm: true
+  hrm_planner_layers: 2          # 2-layer planner Transformer
+  hrm_executor_steps: 4          # T=4 micro-updates per cycle
+  hrm_planner_update_frequency: 4 # Update planner every K=4 L-blocks
+  hrm_use_act_halting: true      # Adaptive Computation Time
+  hrm_one_step_gradient: true    # Use 1-step gradient approximation
+  hrm_deep_supervision: true     # Deep supervision between segments
+
+# TPU v4-16 Multi-Host Mesh Configuration (Actual available topology)
+mesh:
+  # Device configuration for TPU v4-16 (4 hosts × 4 chips = 16 total)
+  device_count: 16
+  mesh_shape: [4, 4]  # 2D topology: data × model (simplified for compatibility)
+  axis_names: ["data", "model"]  # Clear semantic naming
+  
+  # Multi-host configuration
+  num_hosts: 4
+  chips_per_host: 4
+  
+  # Axis mapping for 2D parallelism
+  axis_mapping:
+    data: "data_parallel"      # Batch sharding across 4 devices
+    model: "model_parallel"    # Tensor parallel across 4 devices
+  
+  # Topology optimization for v4-32
+  topology_type: "3d_mesh"
+  optimize_for_bisection: true
+  use_gspmd: true              # Enable GSPMD for automatic sharding
+  
+  # Multi-host initialization
+  distributed_init:
+    coordinator_address: "node-1:8476"  # Coordinator on first host
+    num_processes: 4                    # One process per host
+    process_id: "${PROCESS_ID}"         # Set via environment variable
+    local_device_ids: "0,1,2,3,4,5,6,7"  # 8 chips per host
+
+# Advanced 2D Sharding Strategy
+sharding:
+  # Enable 2D sharding (data + model parallelism)
+  use_3d_sharding: false
+  use_fsdp: false
+  
+  # Model parallelism (1D tensor parallel)
+  model_parallel:
+    type: "1d_tensor_parallel"
+    axes: ["model"]  # Use model axis for tensor parallelism
+    
+    # Weight matrix sharding patterns for 2D mesh
+    dense_layers:
+      # Attention layers - 1D sharding
+      attention_qkv: "column"     # P(None, 'model') 
+      attention_out: "row"        # P('model', None)
+      
+      # FFN layers - 1D sharding
+      ffn_gate_up: "column"       # P(None, 'model')
+      ffn_down: "row"             # P('model', None)
+    
+    # Embedding sharding - shard vocab dimension
+    embeddings:
+      vocab_embedding: "model_shard"  # P('model', None)
+      position_embedding: "replicated"
+  
+  # Data parallelism - batch sharding
+  data_parallel:
+    axis: "data"
+    batch_sharding: true
+    gradient_reduction: "pmean"
+    reduce_axes: ["data"]  # Only reduce across data axis
+    
+  # S5 sharding - keep stable with replication
+  s5_sharding:
+    parameters: "replicated"
+    states: "data_parallel"
+    
+  # Activation sharding patterns
+  activations:
+    batch_seq_hidden: "P('data', None, None)"           # [batch, seq, hidden]
+    batch_seq_heads_dim: "P('data', None, 'model', None)"  # [batch, seq, heads, dim]
+
+# Training Configuration (scaled for v4-32)
+training:
+  # Basic training settings
+  total_steps: 100000
+  learning_rate: 2.0e-4  # Slightly higher for larger batch
+  warmup_steps: 5000
+  weight_decay: 0.1
+  
+  # Batch configuration - 4x scaling from v4-8
+  global_batch_size: 256   # 4x increase: 32 devices × 8 = 256
+  micro_batch_size: 8      # Keep same per-device batch size
+  gradient_accumulation_steps: 1
+  
+  # Optimization
+  optimizer: "adamw"
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Learning rate schedule
+  lr_schedule: "cosine_with_warmup"
+  min_lr_ratio: 0.1
+  
+  # Mixed precision - optimized for TPU v4
+  use_mixed_precision: true
+  precision: "bfloat16"
+  param_dtype: "float32"      # Keep params in fp32 for stability
+  compute_dtype: "bfloat16"   # Use bf16 for compute
+  
+  # Multi-host training settings
+  sync_batch_stats: true      # Synchronize batch norm stats across hosts
+  all_reduce_dtype: "float32" # Use fp32 for gradient reductions
+  
+  # Curriculum Learning - adjusted for larger batch
+  curriculum:
+    phases:
+      - name: "phase_0"
+        steps: 20000
+        chunk_size: 4096
+        lr: 2.0e-4
+        
+      - name: "phase_1" 
+        steps: 40000
+        chunk_size: 8192
+        lr: 1.6e-4
+        
+      - name: "phase_2"
+        steps: 40000
+        chunk_size: 16384
+        lr: 1.0e-4
+
+# System Configuration for Multi-Host TPU
+system:
+  # JAX configuration for multi-host
+  jax_enable_x64: false
+  jax_debug_nans: false
+  jax_disable_jit: false
+  
+  # Multi-host specific settings
+  jax_coordination_service: true
+  jax_enable_async_collective_offload: true
+  
+  # Memory management for larger model
+  preallocate_memory: true
+  memory_fraction: 0.95  # Use more memory on v4-32
+  
+  # Performance tuning
+  enable_async_dispatch: true
+  enable_fast_math: true
+  xla_force_host_platform_device_count: 8  # 8 devices per host
+
+# Multi-Host Distributed Configuration
+distributed:
+  # Coordinator configuration
+  coordinator_address: "node-1:8476"
+  coordinator_bind_address: "0.0.0.0:8476"
+  
+  # Process configuration
+  num_processes: 4
+  process_id: "${PROCESS_ID}"  # 0, 1, 2, 3 for each host
+  
+  # Device assignment
+  local_device_ids: [0, 1, 2, 3, 4, 5, 6, 7]  # 8 TPU chips per host
+  
+  # Communication settings
+  collective_timeout_ms: 300000  # 5 minutes for large model
+  heartbeat_interval_ms: 10000   # 10 second heartbeat
+  
+  # Fault tolerance
+  enable_checkpointing_on_preemption: true
+  max_restarts: 3
+
+# Checkpointing - optimized for multi-host
+checkpointing:
+  save_every_n_steps: 1000
+  keep_n_checkpoints: 5
+  async_checkpointing: true
+  
+  # Multi-host checkpointing
+  checkpoint_manager: "orbax"
+  save_optimizer_state: true
+  checkpoint_on_preemption: true
+  
+  # Logging
+  log_every_n_steps: 100
+  eval_every_n_steps: 1000
+
+# Data Configuration - same as v4-8 but with larger batch processing
+data:
+  # HuggingFace authentication
+  huggingface_token: "${HF_TOKEN}"
+  
+  sources:
+    # Same data sources as v4-8
+    - name: "fineweb"
+      dataset: "HuggingFaceFW/fineweb"
+      config: "sample-100BT"
+      weight: 0.45
+      streaming: true
+      text_column: "text"
+      split: "train"
+      
+    - name: "arxiv"
+      dataset: "common-pile/arxiv_papers_filtered"
+      weight: 0.10
+      streaming: true
+      text_column: "text"
+      split: "train"
+      
+    - name: "the_stack"
+      dataset: "bigcode/the-stack-dedup"
+      weight: 0.30
+      streaming: true
+      text_column: "content"
+      split: "train"
+      
+    - name: "starcoder"
+      dataset: "bigcode/starcoderdata"
+      data_dir: "python"
+      weight: 0.15
+      streaming: true
+      text_column: "content"
+      split: "train"
+  
+  # Multi-host data loading
+  dataloader:
+    num_workers_per_host: 4      # 4 workers per host
+    prefetch_factor: 2
+    persistent_workers: true
+    multiprocessing_context: "spawn"
+  
+  # Context and packing configuration
+  max_length: 65536
+  pack_length: 65536
+  overlap_size: 512
+  maintain_doc_boundaries: true
+  link_segments: true
+  seed: 42
+  
+  # Tokenizer configuration
+  tokenizer_name: "gpt2"
+  vocab_size: 50257
+  
+  # Long-document packing for BigBird efficiency
+  curriculum_lengths: [4096, 8192, 16384, 32768, 65536]
+  
+  # Span denoising for long-range routing
+  span_denoising:
+    enabled: true
+    probability: 0.175
+    mask_ratio: 0.15
+    apply_to: ["fineweb", "arxiv"]
+
+# Logging and Monitoring - enhanced for multi-host
+logging:
+  log_level: "INFO"
+  log_dir: "logs"
+  log_to_file: true
+  log_to_console: true
+  structured_logging: true  # Enable structured logging for multi-host
+  log_interval_steps: 100
+  eval_interval_steps: 1000
+  
+  # Multi-host logging
+  log_host_metrics: true
+  aggregate_host_logs: true
+  
+  # Monitoring
+  use_wandb: false
+  wandb_project: "valkyrie-tpu-v4-32"
+  
+  # Performance monitoring
+  profile_steps: [100, 200, 300]  # Profile these steps
+  memory_profiling: true
+
+# Validation and Testing
+validation:
+  run_s5_tests: false
+  run_attention_tests: false
+  run_distributed_tests: true  # Enable distributed validation
+  test_mesh_communication: true

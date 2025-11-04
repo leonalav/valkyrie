@@ -528,7 +528,16 @@ class TrainingLoop:
             logger.info(f"Mesh axis compatibility verified: all spec axes {spec_axes} are available in mesh {mesh_axes}")
         
         # Initialize model parameters
-        dummy_input = jnp.ones((1, self.chunk_config.chunk_size), dtype=jnp.int32)
+        # Use batch size compatible with data parallel dimension
+        # Get the size of the first axis (data parallel axis)
+        if hasattr(self.mesh, 'shape') and len(self.mesh.shape) > 0:
+            # For JAX mesh, shape is a dict-like object with axis names as keys
+            axis_names = list(self.mesh.shape.keys()) if hasattr(self.mesh.shape, 'keys') else self.mesh.axis_names
+            first_axis = axis_names[0] if axis_names else 'data'
+            data_parallel_size = self.mesh.shape[first_axis]
+        else:
+            data_parallel_size = 4  # Default fallback
+        dummy_input = jnp.ones((data_parallel_size, self.chunk_config.chunk_size), dtype=jnp.int32)
         
         with self.mesh:
             # Initialize parameters with sharding

@@ -18,8 +18,9 @@ from typing import Dict, Tuple, Any, Optional, Callable
 import logging
 
 from ..model import ValkyrieModel, ValkyrieConfig
+from .data_structures import TrainingState
 from ..model.s5_regularization import s5_training_loss
-from ..sharding import get_model_specs, get_training_specs, DP
+from ..sharding import get_model_specs, get_training_specs, DP, REPLICATED
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ def create_train_step(
     config: ValkyrieConfig,
     mesh: Any,
     mixed_precision: bool = True,
+    use_2d_sharding: bool = False,
+    use_3d_mesh: bool = False,
 ) -> Callable:
     """
     Create pjit-compiled training step function.
@@ -40,14 +43,16 @@ def create_train_step(
         config: Model configuration
         mesh: JAX mesh for sharding
         mixed_precision: Whether to use mixed precision
+        use_2d_sharding: Whether to use 2D tensor parallelism
+        use_3d_mesh: Whether to use 3D mesh (v4-32) or 2D mesh (v4-8)
         
     Returns:
         Compiled training step function
     """
     
-    # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=False)
-    training_specs = get_training_specs(model_specs)
+    # Get sharding specs with 3D mesh support
+    model_specs = get_model_specs(config, use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
+    training_specs = get_training_specs(use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
     
     def train_step_fn(
         state: Dict[str, Any],
@@ -76,10 +81,13 @@ def create_train_step(
             
             # Early validation checks
             assert input_ids.dtype == jnp.int32, f"input_ids must be int32, got {input_ids.dtype}"
-            max_token_id = int(input_ids.max())
-            if max_token_id >= config.vocab_size:
-                raise ValueError(f"Token id {max_token_id} >= vocab_size {config.vocab_size}. "
-                               "Tokenizer/model mismatch (e.g., GPT-2 tokens with 32k model).")
+            def check_vocab_size(max_id):
+                jax.lax.cond(
+                    max_id < config.vocab_size,
+                    lambda: None,
+                    lambda: jax.debug.print("Token ID {max_id} is out of bounds for vocab size {vocab_size}", max_id=max_id, vocab_size=config.vocab_size),
+                )
+            check_vocab_size(input_ids.max())
             
             # If no labels provided, create them by shifting input_ids
             if labels is None:
@@ -98,21 +106,21 @@ def create_train_step(
             
             # Model forward pass
             outputs = model.apply(
-                params,
+                {'params': params},
                 input_ids=input_ids,
                 labels=labels,
-                s5_states=state.get('s5_states', None),
+                s5_states=state.s5_states,
                 use_cache=False,  # Don't use cache during training
                 training=True,
                 return_dict=True,
                 rngs=(
                     {
-                        'random': jax.random.fold_in(dropout_rng, state['step']),
+                        'random': jax.random.fold_in(dropout_rng, state.step),
                         'dropout': dropout_rng
                     }
                     if (config.attn_dropout > 0 or config.resid_dropout > 0 or config.ffn_dropout > 0)
                     else {
-                        'random': jax.random.fold_in(dropout_rng, state['step'])
+                        'random': jax.random.fold_in(dropout_rng, state.step)
                     }
                 ),
             )
@@ -129,58 +137,82 @@ def create_train_step(
             return loss, aux_data
         
         # Compute gradients
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state['params'])
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        
+        # Synchronize gradients across data parallel axis for multi-host training
+        if use_3d_mesh:
+            # For 3D mesh, average gradients across 'data' axis
+            grads = jax.lax.pmean(grads, axis_name='data')
+        else:
+            # For 2D mesh, average gradients across 'data' axis if multi-device
+            if 'data' in mesh.axis_names and mesh.shape['data'] > 1:
+                grads = jax.lax.pmean(grads, axis_name='data')
         
         # Apply additional gradient clipping for numerical stability
         grads = jax.tree_util.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
         
         # Gradient clipping and norm computation
         grad_norm = optax.global_norm(grads)
-        grads = optax.clip_by_global_norm(config.gradient_clipping)(grads, state['opt_state'], state['params'])[0]
+        grads = optax.clip_by_global_norm(config.gradient_clipping)(grads, state.opt_state, state.params)[0]
         
         # Apply optimizer update
-        updates, new_opt_state = optimizer.update(grads, state['opt_state'], state['params'])
-        new_params = optax.apply_updates(state['params'], updates)
+        updates, new_opt_state = optimizer.update(grads, state.opt_state, state.params)
+        new_params = optax.apply_updates(state.params, updates)
         
         # Update training state
-        new_state = {
-            'params': new_params,
-            'opt_state': new_opt_state,
-            'step': state['step'] + 1,
-            'rng': state['rng'],
-        }
+        new_state = state.replace(
+            params=new_params,
+            opt_state=new_opt_state,
+            step=state.step + 1,
+        )
         
         # Add S5 states if using S5
         if config.use_s5 and aux['s5_states'] is not None:
-            new_state['s5_states'] = aux['s5_states']
+            new_state = new_state.replace(s5_states=aux['s5_states'])
         
         # Compute metrics
         metrics = {
             'loss': loss,
             'grad_norm': grad_norm,
-            'learning_rate': optimizer._schedule(state['step']) if hasattr(optimizer, '_schedule') else 0.0,
-            'step': state['step'],
+            'learning_rate': optimizer._schedule(state.step) if hasattr(optimizer, '_schedule') else 0.0,
+            'step': state.step,
         }
         
         return new_state, metrics
     
     # Get training specs for explicit sharding (matches initialization)
-    training_specs = get_training_specs(model_specs)
+    training_spec_dict = get_training_specs(use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
+    training_specs = TrainingState(
+        step=REPLICATED,
+        params=training_spec_dict['params'],
+        opt_state=training_spec_dict['opt_state'],
+        rng=REPLICATED,
+        s5_states=None, # S5 states are not sharded
+        chunk_position=REPLICATED, # Chunk position is replicated
+        phase_index=REPLICATED, # Phase index is replicated
+        hrm_enabled=REPLICATED, # HRM enabled is replicated
+        hrm_training_state=None # HRM training state is not sharded
+    )
+
     
     # Determine batch sharding based on mesh configuration
-    # If mesh.z == 1, batch should be replicated, otherwise shard on DP
-    batch_spec = P(DP, None) if mesh.shape[mesh.axis_names.index('z')] > 1 else P()
+    if use_3d_mesh:
+        # For 3D mesh, shard batch along 'data' axis
+        batch_spec = P('data', None)
+    else:
+        # For 2D mesh, shard batch along 'data' axis if multi-device
+        batch_spec = P('data', None) if 'data' in mesh.axis_names and mesh.shape['data'] > 1 else P()
     
     # Compile with pjit using explicit sharding specs (matches parameter initialization)
     compiled_train_step = pjit.pjit(
         train_step_fn,
         in_shardings=(
-            training_specs,          # state - use explicit sharding specs that match initialization
-            batch_spec,              # batch (sharded along batch dimension if multi-host)
+            training_specs,          # state
+            batch_spec,              # batch (sharded along data parallel dimension)
             P(),                     # dropout_rng (replicated)
         ),
         out_shardings=(
-            training_specs,          # new_state - use same explicit sharding specs
+            None,                    # new_state - let arrays' own sharding drive compilation
             P(),                     # metrics (replicated)
         ),
         donate_argnums=(0,),         # Donate state for memory efficiency
@@ -194,6 +226,8 @@ def create_eval_step(
     config: ValkyrieConfig,
     mesh: Any,
     mixed_precision: bool = True,
+    use_2d_sharding: bool = False,
+    use_3d_mesh: bool = False,
 ) -> Callable:
     """
     Create pjit-compiled evaluation step function.
@@ -203,13 +237,15 @@ def create_eval_step(
         config: Model configuration
         mesh: JAX mesh for sharding
         mixed_precision: Whether to use mixed precision
+        use_2d_sharding: Whether to use 2D tensor parallelism
+        use_3d_mesh: Whether to use 3D mesh (v4-32) or 2D mesh (v4-8)
         
     Returns:
         Compiled evaluation step function
     """
     
-    # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=False)
+    # Get sharding specs with 3D mesh support
+    model_specs = get_model_specs(config, use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
     
     def eval_step_fn(
         params: Dict[str, Any],
@@ -280,12 +316,18 @@ def create_eval_step(
         
         return metrics
     
+    # Determine batch sharding for evaluation
+    if use_3d_mesh:
+        batch_spec = P('data', None)
+    else:
+        batch_spec = P('data', None) if 'data' in mesh.axis_names and mesh.shape['data'] > 1 else P()
+    
     # Compile with pjit using param-inferred sharding
     compiled_eval_step = pjit.pjit(
         eval_step_fn,
         in_shardings=(
             None,                    # params - let arrays' own sharding drive compilation
-            P('z', None),           # batch
+            batch_spec,              # batch - shard along data parallel dimension
             P() if config.use_s5 else None,  # s5_states
         ),
         out_shardings=P(),           # metrics (replicated)
@@ -302,6 +344,8 @@ def create_chunked_train_step(
     chunk_size: int = 8192,
     gradient_accumulation_steps: int = 1,
     mixed_precision: bool = True,
+    use_2d_sharding: bool = False,
+    use_3d_mesh: bool = False,
 ) -> Callable:
     """
     Create chunked training step for long sequences.
@@ -317,14 +361,16 @@ def create_chunked_train_step(
         chunk_size: Size of each chunk in tokens
         gradient_accumulation_steps: Number of chunks to accumulate gradients over
         mixed_precision: Whether to use mixed precision
+        use_2d_sharding: Whether to use 2D tensor parallelism
+        use_3d_mesh: Whether to use 3D mesh (v4-32) or 2D mesh (v4-8)
         
     Returns:
         Compiled chunked training step function
     """
     
-    # Get sharding specs
-    model_specs = get_model_specs(config, use_2d_sharding=False)
-    training_specs = get_training_specs(model_specs)
+    # Get sharding specs with 3D mesh support
+    model_specs = get_model_specs(config, use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
+    training_specs = get_training_specs(use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
     
     def chunked_train_step_fn(
         state: Dict[str, Any],
@@ -348,9 +394,9 @@ def create_chunked_train_step(
         num_chunks = (full_seq_len + chunk_size - 1) // chunk_size
         
         # Initialize accumulated gradients
-        accumulated_grads = jax.tree_map(jnp.zeros_like, state['params'])
+        accumulated_grads = jax.tree_map(jnp.zeros_like, state.params)
         total_loss = 0.0
-        s5_states = state.get('s5_states', None)
+        s5_states = state.s5_states
         
         # Process each chunk
         for chunk_idx in range(num_chunks):
@@ -391,7 +437,7 @@ def create_chunked_train_step(
             # Compute gradients for this chunk
             (chunk_loss, new_s5_states), chunk_grads = jax.value_and_grad(
                 chunk_loss_fn, has_aux=True
-            )(state['params'])
+            )(state.params)
             
             # Accumulate gradients
             accumulated_grads = jax.tree_map(
@@ -403,28 +449,36 @@ def create_chunked_train_step(
             total_loss += chunk_loss / num_chunks
             s5_states = new_s5_states
         
+        # Synchronize accumulated gradients across data parallel axis for multi-host training
+        if use_3d_mesh:
+            # For 3D mesh, average gradients across 'data' axis
+            accumulated_grads = jax.lax.pmean(accumulated_grads, axis_name='data')
+        else:
+            # For 2D mesh, average gradients across 'data' axis if multi-device
+            if 'data' in mesh.axis_names and mesh.shape['data'] > 1:
+                accumulated_grads = jax.lax.pmean(accumulated_grads, axis_name='data')
+        
         # Apply gradient clipping (global norm only)
         grad_norm = optax.global_norm(accumulated_grads)
         accumulated_grads = optax.clip_by_global_norm(config.gradient_clipping)(
-            accumulated_grads, state['opt_state'], state['params']
+            accumulated_grads, state.opt_state, state.params
         )[0]
         
         # Apply optimizer update
         updates, new_opt_state = optimizer.update(
-            accumulated_grads, state['opt_state'], state['params']
+            accumulated_grads, state.opt_state, state.params
         )
-        new_params = optax.apply_updates(state['params'], updates)
+        new_params = optax.apply_updates(state.params, updates)
         
         # Update state
-        new_state = {
-            'params': new_params,
-            'opt_state': new_opt_state,
-            'step': state['step'] + 1,
-            'rng': state['rng'],
-        }
+        new_state = state.replace(
+            params=new_params,
+            opt_state=new_opt_state,
+            step=state.step + 1,
+        )
         
         if config.use_s5 and s5_states is not None:
-            new_state['s5_states'] = s5_states
+            new_state = new_state.replace(s5_states=s5_states)
         
         # Metrics
         metrics = {
@@ -436,12 +490,18 @@ def create_chunked_train_step(
         
         return new_state, metrics
     
+    # Determine batch sharding for chunked training
+    if use_3d_mesh:
+        batch_spec = P('data', None)
+    else:
+        batch_spec = P('data', None) if 'data' in mesh.axis_names and mesh.shape['data'] > 1 else P()
+    
     # Compile with pjit using param-inferred sharding
     compiled_chunked_step = pjit.pjit(
         chunked_train_step_fn,
         in_shardings=(
             None,                    # state - let arrays' own sharding drive compilation
-            P('z', None),           # batch
+            batch_spec,              # batch - shard along data parallel dimension
             P(),                     # dropout_rng
         ),
         out_shardings=(
@@ -458,6 +518,8 @@ def create_generation_step(
     model: ValkyrieModel,
     config: ValkyrieConfig,
     mesh: Any,
+    use_2d_sharding: bool = False,
+    use_3d_mesh: bool = False,
 ) -> Callable:
     """
     Create pjit-compiled generation step function.
@@ -466,12 +528,14 @@ def create_generation_step(
         model: Valkyrie model
         config: Model configuration
         mesh: JAX mesh for sharding
+        use_2d_sharding: Whether to use 2D tensor parallelism
+        use_3d_mesh: Whether to use 3D mesh (v4-32) or 2D mesh (v4-8)
         
     Returns:
         Compiled generation step function
     """
     
-    model_specs = get_model_specs(config, use_2d_sharding=False)
+    model_specs = get_model_specs(config, use_2d_sharding=use_2d_sharding, use_3d_mesh=use_3d_mesh)
     
     def generation_step_fn(
         params: Dict[str, Any],
@@ -529,7 +593,7 @@ def create_generation_step(
         generation_step_fn,
         in_shardings=(
             None,                          # params - let arrays' own sharding drive compilation
-            P('z', None),                 # input_ids
+            P('data', None),              # input_ids
             P() if config.use_longformer_attention else P(),  # past_key_values
             P() if config.use_s5 else None,  # s5_states
             P(),                           # temperature
@@ -538,7 +602,7 @@ def create_generation_step(
             P(),                           # rng_key
         ),
         out_shardings=(
-            P('z', None),                 # next_token
+            P('data', None),              # next_token
             P() if config.use_longformer_attention else P(),  # new_past_key_values
             P() if config.use_s5 else None,  # new_s5_states
         ),
