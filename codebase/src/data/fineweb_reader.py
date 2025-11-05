@@ -19,6 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
+from jax import tree_util as jtu
 
 from .tokenizer import create_tokenizer, TokenizerConfig, tokenize_for_training
 
@@ -259,31 +260,40 @@ class FineWebDataset:
         
         # Yield remaining batch if not empty
         if batch:
-            yield self._collate_batch(batch)
+            collated_batch = self._collate_batch(batch)
+            self._validate_batch(collated_batch)
+            yield collated_batch
     
-    def _collate_batch(self, chunks: List[Dict[str, jnp.ndarray]]) -> Dict[str, jnp.ndarray]:
-        """
-        Collate list of chunks into a batch.
-        
-        Args:
-            chunks: List of individual chunks
-            
-        Returns:
-            Batched data
-        """
-        
-        if not chunks:
-            raise ValueError("Cannot collate empty batch")
-        
-        # Stack chunks into batch
-        batch = {}
-        
-        for key in chunks[0].keys():
-            # Stack along batch dimension
-            stacked = jnp.stack([chunk[key] for chunk in chunks], axis=0)
-            batch[key] = stacked
-        
-        return batch
+    def _validate_batch(self, batch):
+        assert isinstance(batch, dict), f"Batch must be dict, got {type(batch)}"
+        for k in ["input_ids", "labels", "attention_mask"]:
+            assert k in batch, f"Missing key {k} in batch"
+            assert isinstance(batch[k], jnp.ndarray), f"{k} must be array, got {type(batch[k])}"
+        B = batch["input_ids"].shape[0]
+        T = batch["input_ids"].shape[1]
+        for k in ["labels", "attention_mask"]:
+            assert batch[k].shape[:2] == (B, T), f"{k} shape {batch[k].shape} != (B,T)=({B},{T})"
+        assert batch["input_ids"].dtype == jnp.int32, f"input_ids dtype must be int32, got {batch['input_ids'].dtype}"
+        assert batch["labels"].dtype == jnp.int32, f"labels dtype must be int32, got {batch['labels'].dtype}"
+
+    def _collate_batch(self, chunks):
+        def to_array(x):
+            return jnp.asarray(x)
+
+        batched = jtu.tree_map(lambda *xs: jnp.stack([to_array(x) for x in xs], axis=0), *chunks)
+
+        if isinstance(batched, dict) and "input_ids" in batched and isinstance(batched["input_ids"], dict):
+            inner = batched["input_ids"]
+            flat = {**batched, **inner}
+            del flat["input_ids"]
+            batched = flat
+
+        if "input_ids" in batched: batched["input_ids"] = batched["input_ids"].astype(jnp.int32)
+        if "labels" in batched:    batched["labels"]    = batched["labels"].astype(jnp.int32)
+        if "attention_mask" in batched:
+            batched["attention_mask"] = batched["attention_mask"].astype(jnp.int32)
+
+        return batched
     
     def get_stats(self) -> Dict[str, Any]:
         """Get dataset statistics."""

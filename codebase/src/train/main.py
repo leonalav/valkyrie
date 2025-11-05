@@ -94,31 +94,64 @@ def create_model_from_config(config: Dict[str, Any]) -> ValkyrieModel:
     return model
 
 
-def convert_packed_sequences_to_batch(packed_sequences: List[Dict]) -> Dict[str, jnp.ndarray]:
-    """Convert List[Dict] to batch dictionary with only fields used by training.
-    
-    Args:
-        packed_sequences: List of sequence dictionaries
-        
-    Returns:
-        Dictionary with only the fields used by train_step:
-        - input_ids: [batch_size, pack_length]
+def convert_packed_sequences_to_batch(packed_sequences) -> Dict[str, jnp.ndarray]:
+    """Convert incoming batch/sequence data to the dict format expected by training.
+
+    This function is resilient to different input forms:
+    - If a dict with 'input_ids' (already batched) is provided, it ensures dtypes
+      and returns it directly (including optional labels/attention_mask if present).
+    - If a list/tuple of per-sequence dicts is provided, it stacks the 'input_ids'.
+    - If a list/tuple of objects with .input_ids is provided, it stacks those.
     """
-    if not packed_sequences:
-        raise ValueError("Empty packed_sequences list")
-    
-    # Only stack input_ids since that's all the training code uses
-    input_ids = jnp.stack([seq.input_ids for seq in packed_sequences])
-    
-    return {
-        'input_ids': input_ids,
-    }
+    if packed_sequences is None:
+        raise ValueError("packed_sequences is None")
+
+    # Case 1: Already a batched dict (the FineWebDataset returns this)
+    if isinstance(packed_sequences, dict):
+        batch = {}
+        for key in ('input_ids', 'labels', 'attention_mask'):
+            if key in packed_sequences:
+                arr = packed_sequences[key]
+                # Convert to jnp.ndarray and fix dtype
+                if not isinstance(arr, jnp.ndarray):
+                    arr = jnp.asarray(arr)
+                # Ensure int32 for token-related arrays
+                if key in ('input_ids', 'labels', 'attention_mask'):
+                    arr = arr.astype(jnp.int32)
+                batch[key] = arr
+        if 'input_ids' not in batch:
+            raise ValueError("Batch dict missing 'input_ids'")
+        return batch
+
+    # Case 2: List/tuple of sequences
+    if isinstance(packed_sequences, (list, tuple)):
+        if len(packed_sequences) == 0:
+            raise ValueError("Empty packed_sequences list")
+
+        first = packed_sequences[0]
+        # List of dicts with 'input_ids'
+        if isinstance(first, dict):
+            if 'input_ids' not in first:
+                raise ValueError("Sequence dict missing 'input_ids'")
+            input_ids = jnp.stack([jnp.asarray(seq['input_ids']) for seq in packed_sequences])
+            return {'input_ids': input_ids.astype(jnp.int32)}
+        # List of objects with .input_ids
+        if hasattr(first, 'input_ids'):
+            input_ids = jnp.stack([jnp.asarray(seq.input_ids) for seq in packed_sequences])
+            return {'input_ids': input_ids.astype(jnp.int32)}
+
+    # Unsupported type
+    raise TypeError(f"Unsupported packed_sequences type: {type(packed_sequences)}")
 
 
 def create_batch_iterator(data_loader) -> Iterator[Dict[str, jnp.ndarray]]:
-#     """Create iterator that converts List[PackedSequence] to proper batch format."""
+    # Create iterator that normalizes batch format only if needed.
     for packed_batch in data_loader.get_batch_iterator():
-        yield convert_packed_sequences_to_batch(packed_batch)
+        if isinstance(packed_batch, dict) and 'input_ids' in packed_batch:
+            # Already in the expected format
+            yield packed_batch
+        else:
+            yield convert_packed_sequences_to_batch(packed_batch)
 
 
 def setup_training_components(config: Dict[str, Any], model: ValkyrieModel):
